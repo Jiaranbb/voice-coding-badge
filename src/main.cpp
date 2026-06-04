@@ -1,7 +1,46 @@
 #include <Arduino.h>
 #include <BleKeyboard.h>
 #include <M5Unified.h>
+#include <time.h>
+#include <string.h>
 #include "usagi_animations.h"
+#include "clock_font.h"
+#include "weather_icons.h"
+#include <NimBLEDevice.h>
+
+// ---- Weather pushed from the Mac over a custom BLE characteristic ----
+// The Mac (which has internet) fetches the temperature and writes it here, so
+// the watch can show weather without any WiFi of its own.
+static char gWeatherTemp[16] = {0};  // integer degrees C as text, e.g. "24" / "-3"
+static int gWeatherCond = -1;        // condition code (see WeatherCond), -1 = unknown
+static uint32_t gWeatherMs = 0;      // millis() of last write (0 = never received)
+static volatile bool gWeatherDirty = false;  // set on receive -> force a clock redraw
+static portMUX_TYPE gWeatherMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Condition codes the Mac sends after a '|': 0 clear, 1 partly cloudy, 2 cloudy,
+// 3 rain, 4 snow, 5 thunderstorm, 6 fog.
+class WeatherCharCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* c) override {
+    std::string v = c->getValue();  // "<temp>|<cond>", cond optional
+    const size_t bar = v.find('|');
+    const std::string t = (bar == std::string::npos) ? v : v.substr(0, bar);
+    const int cond = (bar == std::string::npos) ? -1 : atoi(v.substr(bar + 1).c_str());
+    portENTER_CRITICAL(&gWeatherMux);
+    strncpy(gWeatherTemp, t.c_str(), sizeof(gWeatherTemp) - 1);
+    gWeatherTemp[sizeof(gWeatherTemp) - 1] = '\0';
+    gWeatherCond = cond;
+    gWeatherMs = millis();
+    portEXIT_CRITICAL(&gWeatherMux);
+    gWeatherDirty = true;
+    Serial.printf("[Weather] temp='%s' cond=%d\n", gWeatherTemp, cond);
+  }
+};
+static WeatherCharCallbacks gWeatherCallbacks;
+
+// Forward declarations for the idle-sleep / raise-to-wake helpers, which are
+// defined after the drawing routines but referenced earlier.
+void wakeDisplay();
+void enterDisplaySleep();
 
 class DebugBleKeyboard : public BleKeyboard {
  public:
@@ -9,19 +48,34 @@ class DebugBleKeyboard : public BleKeyboard {
       : BleKeyboard(deviceName, deviceManufacturer, batteryLevel) {}
 
  protected:
+  // Called after the HID services are set up but before advertising starts —
+  // the right spot to register our custom weather characteristic.
+  void onStarted(BLEServer* pServer) override {
+    NimBLEService* svc = pServer->createService(NimBLEUUID((uint16_t)0xFFF0));
+    NimBLECharacteristic* ch = svc->createCharacteristic(
+        NimBLEUUID((uint16_t)0xFFF1), NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+    ch->setCallbacks(&gWeatherCallbacks);
+    svc->start();
+    Serial.println("[Weather] GATT service 0xFFF0 / char 0xFFF1 ready");
+  }
+
   void onConnect(BLEServer* pServer) override {
     Serial.println("[BLE] connected");
     BleKeyboard::onConnect(pServer);
+    // Keep advertising so a second central (the Mac weather helper) can connect
+    // alongside the HID host. NimBLE allows up to 3 simultaneous connections.
+    NimBLEDevice::startAdvertising();
   }
 
   void onDisconnect(BLEServer* pServer) override {
     Serial.println("[BLE] disconnected");
     BleKeyboard::onDisconnect(pServer);
+    NimBLEDevice::startAdvertising();
   }
 };
 
 // Short name avoids macOS truncation and stale half-paired device confusion.
-DebugBleKeyboard bleKeyboard("VB-Ctrl", "Jiaran", 100);
+DebugBleKeyboard bleKeyboard("537VoiceCoding", "Jiaran", 100);
 
 enum class UiState {
   Booting,
@@ -43,11 +97,21 @@ enum class StatusIndicator {
 static UiState currentState = UiState::Booting;
 static bool voiceKeyDown = false;
 static bool voiceLatchMode = false;
+static uint32_t voiceStartMs = 0;
 static bool testMode = false;
 static uint32_t lastActionMs = 0;
 static uint32_t lastVoiceReleaseMs = 0;
 static uint32_t lastUserActivityMs = 0;
 static bool displayDimmed = false;
+static bool displayAsleep = false;
+static uint32_t lastImuPollMs = 0;
+static float lastAccelX = 0.0f;
+static float lastAccelY = 0.0f;
+static float lastAccelZ = 0.0f;
+static bool accelBaselineValid = false;
+static int lastDrawnClockHm = -1;
+static uint32_t sleepEnterMs = 0;
+static bool comboToggleHandled = false;
 static bool lastBleConnected = false;
 static bool pendingSendAfterVoice = false;
 static uint32_t pendingSendMs = 0;
@@ -70,6 +134,7 @@ static int32_t currentBatteryLevel = -1;
 static int8_t currentChargingState = -1;
 static int32_t lastDrawnBatteryLevel = -100;
 static int8_t lastDrawnChargingState = -100;
+static int16_t lastReportedBleBatteryLevel = -1;
 static uint16_t activeLabelRevealMs = 0;
 static uint16_t lastLabelVisibleWidth = 0;
 static bool activeLabelLoops = false;
@@ -78,9 +143,16 @@ constexpr uint32_t kVoiceCommitDelayMs = 1100;
 constexpr uint32_t kVoiceSendDelayMs = kVoiceCommitDelayMs;
 constexpr uint32_t kUndoWindowMs = 8000;
 constexpr uint32_t kDimAfterIdleMs = 30000;
+constexpr uint32_t kSleepAfterIdleMs = 300000;   // 5 min no activity -> screen off (sleep)
+constexpr uint32_t kImuPollIntervalMs = 120;     // raise-to-wake IMU poll cadence while asleep
+constexpr float kWakeMotionThreshold = 0.30f;    // g; sum of |accel delta| that counts as "picked up"
+constexpr uint8_t kSleepClockBrightness = 32;    // dim brightness for the always-on sleep clock
+constexpr uint32_t kRaiseWakeArmDelayMs = 1500;  // settle time before raise-to-wake arms after sleeping
+constexpr uint32_t kWeatherStaleMs = 3UL * 60 * 60 * 1000;  // weather older than 3h -> fall back to weekday
 constexpr uint32_t kBatteryRefreshMs = 5000;
 constexpr uint32_t kVoiceHoldStartMs = 180;
 constexpr uint32_t kVoiceDoubleClickMs = 420;
+constexpr uint32_t kMaxVoiceHoldMs = 30000;  // watchdog: auto-release voice/latch so it can never stick
 constexpr uint8_t kActiveBrightness = 120;
 constexpr uint8_t kDimBrightness = 45;
 constexpr uint8_t kLowBatteryLevel = 20;
@@ -136,6 +208,16 @@ void updateBatterySnapshot(bool force = false) {
   currentChargingState = charging == m5::Power_Class::is_charging_t::is_charging
                              ? 1
                              : charging == m5::Power_Class::is_charging_t::is_discharging ? 0 : -1;
+
+  // Report the real battery level over BLE (Battery Service 0x2A19) so the host
+  // (e.g. macOS Bluetooth menu) shows the true charge instead of the initial 100%.
+  if (currentBatteryLevel >= 0) {
+    const uint8_t bleLevel = currentBatteryLevel > 100 ? 100 : currentBatteryLevel;
+    if (bleLevel != lastReportedBleBatteryLevel) {
+      bleKeyboard.setBatteryLevel(bleLevel);
+      lastReportedBleBatteryLevel = bleLevel;
+    }
+  }
 }
 
 bool shouldShowBatteryStatus() {
@@ -202,6 +284,7 @@ void setDisplayDimmed(bool dimmed) {
 
 void noteUserActivity() {
   lastUserActivityMs = millis();
+  wakeDisplay();
   setDisplayDimmed(false);
 }
 
@@ -209,8 +292,12 @@ void updatePowerSaving() {
   if (voiceKeyDown) return;
 
   const uint32_t now = millis();
-  if (!displayDimmed && now - lastUserActivityMs >= kDimAfterIdleMs) {
+  const uint32_t idle = now - lastUserActivityMs;
+  if (!displayDimmed && idle >= kDimAfterIdleMs) {
     setDisplayDimmed(true);
+  }
+  if (!displayAsleep && idle >= kSleepAfterIdleMs) {
+    enterDisplaySleep();
   }
 }
 
@@ -323,6 +410,214 @@ void showAnimatedState(const UsagiAnimationClip& clip,
   drawBatteryIndicator(true);
 }
 
+static const char* kWeekdayNames[7] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
+static const char* kMonthNames[12] = {"JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+                                      "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"};
+
+// Weather-condition icon (centred at ix,iy) drawn from the colour Apple-emoji
+// bitmaps. Code: 0 clear (sun day / moon night), 1 partly, 2 cloudy, 3 rain,
+// 4 snow, 5 thunderstorm, 6 fog (reuses cloudy). -1/unknown -> clear.
+void drawWeatherIcon(int ix, int iy, int cond, bool day) {
+  const uint16_t* bmp;
+  switch (cond) {
+    case 1: bmp = WeatherIcons::partly; break;
+    case 2:
+    case 6: bmp = WeatherIcons::cloudy; break;
+    case 3: bmp = WeatherIcons::rain; break;
+    case 4: bmp = WeatherIcons::snow; break;
+    case 5: bmp = WeatherIcons::storm; break;
+    default: bmp = day ? WeatherIcons::sun : WeatherIcons::moon; break;
+  }
+  const int w = WeatherIcons::kIconW, h = WeatherIcons::kIconH;
+  const bool prevSwap = M5.Display.getSwapBytes();
+  M5.Display.setSwapBytes(true);
+  M5.Display.pushImage(ix - w / 2, iy - h / 2, w, h, bmp);
+  M5.Display.setSwapBytes(prevSwap);
+}
+
+// Draw "<num>°C" centred at (cx, y) with Font4 and a small raised degree ring.
+void drawSleepTemp(const char* num, int cx, int y) {
+  M5.Display.setFont(&fonts::Font4);
+  M5.Display.setTextSize(1);
+  const int wn = M5.Display.textWidth(num);
+  const int wc = M5.Display.textWidth("C");
+  const int ringR = 4, gap1 = 3, gap2 = 4;
+  const int total = wn + gap1 + ringR * 2 + gap2 + wc;
+  const int x = cx - total / 2;
+  M5.Display.setTextColor(0xFFFFFF, kBg);
+  M5.Display.setTextDatum(middle_left);
+  M5.Display.drawString(num, x, y);
+  const int ringCx = x + wn + gap1 + ringR;
+  M5.Display.drawCircle(ringCx, y - 7, ringR, 0xFFFFFF);
+  M5.Display.drawString("C", ringCx + ringR + gap2, y);
+}
+
+// Sleep "always-on" clock: shows Beijing time HH:MM plus the weekday (English),
+// no animation. Redraws only when the minute changes to save power.
+void drawSleepClock(bool force = false) {
+  if (!displayAsleep) return;
+
+  int hh = -1, mm = -1, mon = -1, day = -1, wd = -1;
+  if (M5.Rtc.isEnabled()) {
+    const auto dt = M5.Rtc.getDateTime();  // RTC holds Beijing local time
+    hh = dt.time.hours;
+    mm = dt.time.minutes;
+    mon = dt.date.month;
+    day = dt.date.date;
+    wd = dt.date.weekDay;
+  }
+
+  const int key = (hh >= 0) ? (hh * 60 + mm) : -2;
+  if (!force && key == lastDrawnClockHm && !gWeatherDirty) return;
+  lastDrawnClockHm = key;
+  gWeatherDirty = false;
+
+  M5.Display.fillScreen(kBg);
+
+  // Save the exact prior text state and restore it on exit, so the normal UI
+  // (which relies on the default font / its own text size) is never disturbed.
+  const auto savedFont = M5.Display.getFont();
+  const auto savedDatum = M5.Display.getTextDatum();
+  const float savedSizeX = M5.Display.getTextSizeX();
+  const float savedSizeY = M5.Display.getTextSizeY();
+
+  // Left column: big rounded stacked hours over minutes, drawn from the
+  // pre-rendered anti-aliased digit bitmaps (smooth, no upscaling jaggies).
+  const int dw = ClockFont::kDigitW;
+  const int dh = ClockFont::kDigitH;
+  const int lx = 158;            // horizontal centre of the two-digit block
+  const int x0 = lx - dw;        // left digit
+  const int x1 = lx;             // right digit
+  const int yH = 116;            // hours row top
+  const int yM = yH + dh + 6;    // minutes row top
+  if (hh >= 0) {
+    const bool prevSwap = M5.Display.getSwapBytes();
+    M5.Display.setSwapBytes(true);
+    M5.Display.pushImage(x0, yH, dw, dh, ClockFont::kDigits[(hh / 10) % 10]);
+    M5.Display.pushImage(x1, yH, dw, dh, ClockFont::kDigits[hh % 10]);
+    M5.Display.pushImage(x0, yM, dw, dh, ClockFont::kDigits[(mm / 10) % 10]);
+    M5.Display.pushImage(x1, yM, dw, dh, ClockFont::kDigits[mm % 10]);
+    M5.Display.setSwapBytes(prevSwap);
+  }
+
+  // Read the weather snapshot once (pushed from the Mac over BLE).
+  char wtemp[16];
+  int wcond;
+  uint32_t wms;
+  portENTER_CRITICAL(&gWeatherMux);
+  strncpy(wtemp, gWeatherTemp, sizeof(wtemp));
+  wcond = gWeatherCond;
+  wms = gWeatherMs;
+  portEXIT_CRITICAL(&gWeatherMux);
+  wtemp[sizeof(wtemp) - 1] = '\0';
+  const bool haveWeather =
+      wms != 0 && wtemp[0] != '\0' && (millis() - wms) < kWeatherStaleMs;
+
+  // Right column: weather/day-night icon, date, and temperature (or weekday).
+  const int rx = 356;
+  drawWeatherIcon(rx, 158, haveWeather ? wcond : -1, hh >= 6 && hh < 18);
+
+  M5.Display.setFont(&fonts::Font4);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(0xFFFFFF, kBg);
+  if (mon >= 1) {
+    // Date MM·DD with a small raised centre dot.
+    char mmb[3], ddb[3];
+    std::snprintf(mmb, sizeof(mmb), "%02d", mon);
+    std::snprintf(ddb, sizeof(ddb), "%02d", day);
+    M5.Display.fillCircle(rx, 250, 2, 0xFFFFFF);
+    M5.Display.setTextDatum(middle_right);
+    M5.Display.drawString(mmb, rx - 7, 250);
+    M5.Display.setTextDatum(middle_left);
+    M5.Display.drawString(ddb, rx + 7, 250);
+  }
+
+  if (haveWeather) {
+    drawSleepTemp(wtemp, rx, 300);
+  } else {
+    const char* wstr = (wd >= 0 && wd < 7) ? kWeekdayNames[wd] : "";
+    M5.Display.setFont(&fonts::Font4);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(0xFFFFFF, kBg);
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.drawString(wstr, rx, 300);
+  }
+
+  M5.Display.setFont(savedFont);
+  M5.Display.setTextSize(savedSizeX, savedSizeY);
+  M5.Display.setTextDatum(savedDatum);
+}
+
+// Enter the low-power sleep state after a long idle period (or manual power-key
+// click). BLE stays connected so the keyboard keeps working; the screen dims to
+// a low-brightness always-on clock instead of going fully dark.
+void enterDisplaySleep() {
+  if (displayAsleep) return;
+  displayAsleep = true;
+  sleepEnterMs = millis();
+  lastDrawnClockHm = -1;        // force a fresh clock draw
+  M5.Display.setBrightness(kSleepClockBrightness);
+  drawSleepClock(true);
+  accelBaselineValid = false;  // re-establish the motion baseline on next poll
+}
+
+// Wake the screen back up and force a full redraw of the current UI. The text
+// state is left untouched (drawSleepClock restores it), so the normal UI renders
+// exactly as before.
+void wakeDisplay() {
+  if (!displayAsleep) return;
+  displayAsleep = false;
+  lastDrawnClockHm = -1;
+  // Re-assert the panel registers (incl. RGB/BGR colour order) without a hard
+  // reset or clearing. This heals the occasional "everything turns blue" glitch
+  // so toggling sleep + waking recovers colour without a reboot.
+  M5.Display.init_without_reset();
+  M5.Display.setRotation(0);
+  M5.Display.setBrightness(kActiveBrightness);
+  drawStage();
+  drawStatusIndicator(true);
+  drawAnimationFrame(true);
+  drawBatteryIndicator(true);
+}
+
+// Raise-to-wake: while asleep, poll the IMU and wake when the device is moved
+// (e.g. picked up). Falls back to no-op if the IMU is unavailable; buttons
+// still wake the screen via noteUserActivity().
+void updateRaiseToWake() {
+  if (!displayAsleep || !M5.Imu.isEnabled()) return;
+
+  const uint32_t now = millis();
+  // Grace period after entering sleep: let the button press / hand motion settle
+  // before arming raise-to-wake, otherwise a manual power-key sleep wakes instantly.
+  if (now - sleepEnterMs < kRaiseWakeArmDelayMs) {
+    accelBaselineValid = false;
+    return;
+  }
+  if (now - lastImuPollMs < kImuPollIntervalMs) return;
+  lastImuPollMs = now;
+
+  float ax = 0.0f, ay = 0.0f, az = 0.0f;
+  if (!M5.Imu.getAccel(&ax, &ay, &az)) return;
+
+  if (!accelBaselineValid) {
+    lastAccelX = ax;
+    lastAccelY = ay;
+    lastAccelZ = az;
+    accelBaselineValid = true;
+    return;
+  }
+
+  const float motion =
+      fabsf(ax - lastAccelX) + fabsf(ay - lastAccelY) + fabsf(az - lastAccelZ);
+  lastAccelX = ax;
+  lastAccelY = ay;
+  lastAccelZ = az;
+
+  if (motion >= kWakeMotionThreshold) {
+    noteUserActivity();  // wakes the display + redraws
+  }
+}
+
 void showReadyState() {
   updateBatterySnapshot(true);
   if (shouldShowBatteryStatus()) {
@@ -412,8 +707,17 @@ void tapKey(uint8_t key) {
 
 void undoLastInput() {
   if (!bleKeyboard.isConnected()) return;
+  // GUI text fields (Notes, browsers): Cmd+Z undoes the just-dictated text.
   bleKeyboard.press(KEY_LEFT_GUI);
   bleKeyboard.press('z');
+  delay(80);
+  bleKeyboard.releaseAll();
+  delay(40);
+  // Terminals / consoles (Claude Code) ignore Cmd+Z, so also clear the input line
+  // with Ctrl+U (kill line). It's a no-op in standard macOS text fields, so the
+  // two contexts don't interfere.
+  bleKeyboard.press(KEY_LEFT_CTRL);
+  bleKeyboard.press('u');
   delay(80);
   bleKeyboard.releaseAll();
 }
@@ -426,9 +730,10 @@ void typeTestText() {
 void pressVoiceShortcut(uint8_t buzzCount = 1) {
   if (!bleKeyboard.isConnected() || voiceKeyDown) return;
 
-  // WeChat Input voice input is configured on this Mac as Ctrl.
-  bleKeyboard.press(KEY_LEFT_CTRL);
+  // WeChat Input voice input is configured on this Mac as the right Option (Alt) key.
+  bleKeyboard.press(KEY_RIGHT_ALT);
   voiceKeyDown = true;
+  voiceStartMs = millis();
   lastActionMs = millis();
   noteUserActivity();
   setState(UiState::VoiceKeyHeld);
@@ -438,7 +743,7 @@ void pressVoiceShortcut(uint8_t buzzCount = 1) {
 void releaseVoiceShortcut() {
   if (!voiceKeyDown) return;
 
-  bleKeyboard.release(KEY_LEFT_CTRL);
+  bleKeyboard.release(KEY_RIGHT_ALT);
   voiceKeyDown = false;
   voiceLatchMode = false;
   lastVoiceReleaseMs = millis();
@@ -534,6 +839,52 @@ void handleYellowButton() {
   if (btnAPendingTap && now - btnAPendingTapMs > kVoiceDoubleClickMs) {
     btnAPendingTap = false;
   }
+
+  // Safety net: if a push-to-talk release event was missed (BLE/button glitch),
+  // release as soon as the yellow key is physically back up. (Latch mode is
+  // hands-free, so it's excluded — it ends on a separate click.)
+  if (voiceKeyDown && !voiceLatchMode && !M5.BtnA.isPressed()) {
+    releaseVoiceShortcut();
+    clearYellowButtonGesture();
+  }
+}
+
+#ifndef BUILD_BJ_YEAR
+#define BUILD_BJ_YEAR 2026
+#define BUILD_BJ_MON 1
+#define BUILD_BJ_MDAY 1
+#define BUILD_BJ_HOUR 0
+#define BUILD_BJ_MIN 0
+#define BUILD_BJ_SEC 0
+#define BUILD_BJ_WDAY 0
+#endif
+
+// Seed the RTC with the build's Beijing (UTC+8) wall-clock time the first time
+// the device boots (RTC never set). Afterwards the RX8130 keeps time on its own.
+void initClockSource() {
+  if (!M5.Rtc.isEnabled()) {
+    Serial.println("[VoiceBadge] RTC unavailable; sleep clock will show --:--");
+    return;
+  }
+  const auto d = M5.Rtc.getDate();
+  if (d.year < 2025) {
+    struct tm bt = {};
+    bt.tm_year = BUILD_BJ_YEAR - 1900;
+    bt.tm_mon = BUILD_BJ_MON - 1;
+    bt.tm_mday = BUILD_BJ_MDAY;
+    bt.tm_hour = BUILD_BJ_HOUR;
+    bt.tm_min = BUILD_BJ_MIN;
+    bt.tm_sec = BUILD_BJ_SEC;
+    bt.tm_wday = BUILD_BJ_WDAY;
+    M5.Rtc.setDateTime(&bt);
+    Serial.printf("[VoiceBadge] RTC was unset; seeded Beijing time %04d-%02d-%02d %02d:%02d:%02d\n",
+                  (int)BUILD_BJ_YEAR, (int)BUILD_BJ_MON, (int)BUILD_BJ_MDAY,
+                  (int)BUILD_BJ_HOUR, (int)BUILD_BJ_MIN, (int)BUILD_BJ_SEC);
+  }
+  const auto now = M5.Rtc.getDateTime();
+  Serial.printf("[VoiceBadge] RTC now (Beijing) %04d-%02d-%02d %02d:%02d:%02d wday=%d\n",
+                now.date.year, now.date.month, now.date.date, now.time.hours,
+                now.time.minutes, now.time.seconds, now.date.weekDay);
 }
 
 void setup() {
@@ -554,7 +905,10 @@ void setup() {
   M5.BtnB.setHoldThresh(700);
 
   bleKeyboard.begin();
-  Serial.println("[VoiceBadge] BLE keyboard advertising as VB-Ctrl");
+  Serial.println("[VoiceBadge] BLE keyboard advertising as 537VoiceCoding");
+  Serial.printf("[VoiceBadge] IMU (raise-to-wake) %s\n",
+                M5.Imu.isEnabled() ? "enabled" : "NOT available");
+  initClockSource();
   if (testMode) {
     setState(UiState::TestMode);
   } else {
@@ -571,6 +925,41 @@ void loop() {
   }
   lastBleConnected = bleConnected;
 
+  // Yellow + Blue pressed together toggles the sleep clock. (The red/power key is
+  // wired straight to the PMIC and isn't reported to firmware on this board, so
+  // we use a two-button combo instead.) A short buzz confirms the toggle.
+  const bool bothButtonsDown = M5.BtnA.isPressed() && M5.BtnB.isPressed();
+  if (bothButtonsDown && !comboToggleHandled) {
+    comboToggleHandled = true;
+    if (voiceKeyDown) releaseVoiceShortcut();
+    clearYellowButtonGesture();
+    clearPendingSendAfterVoice();
+    buzz(120, 40);
+    if (displayAsleep) {
+      noteUserActivity();  // wake
+    } else {
+      lastUserActivityMs = millis();
+      enterDisplaySleep();  // sleep
+    }
+  } else if (!bothButtonsDown) {
+    comboToggleHandled = false;
+  }
+
+  // While asleep, only the always-on clock and wake detection run. Returning
+  // early keeps the voice/UI drawing (setState, animations) from painting over
+  // the clock. A single front-button press or movement wakes; both-button combo
+  // is handled above (and must not double-trigger a wake here).
+  if (displayAsleep) {
+    updateRaiseToWake();
+    if (!bothButtonsDown && (M5.BtnA.wasPressed() || M5.BtnB.wasPressed())) {
+      noteUserActivity();
+    } else {
+      drawSleepClock();
+    }
+    delay(20);
+    return;
+  }
+
   if (!bleConnected) {
     if (voiceKeyDown) {
       bleKeyboard.releaseAll();
@@ -580,10 +969,14 @@ void loop() {
     clearPendingSendAfterVoice();
     clearYellowButtonGesture();
     if (!testMode) setState(UiState::WaitingForBluetooth);
-    drawStatusIndicator();
-    drawAnimationFrame();
-    drawBatteryIndicator();
     updatePowerSaving();
+    if (displayAsleep) {
+      drawSleepClock();
+    } else {
+      drawStatusIndicator();
+      drawAnimationFrame();
+      drawBatteryIndicator();
+    }
     delay(20);
     return;
   }
@@ -603,6 +996,18 @@ void loop() {
     drawAnimationFrame();
     drawBatteryIndicator();
     updatePowerSaving();
+    delay(20);
+    return;
+  }
+
+  // While the two-button combo is held (e.g. right after it woke the screen),
+  // don't treat the held buttons as voice/send — just keep the normal UI up.
+  if (bothButtonsDown || comboToggleHandled) {
+    updatePowerSaving();
+    refreshReadyStatusIndicator();
+    drawStatusIndicator();
+    drawAnimationFrame();
+    drawBatteryIndicator();
     delay(20);
     return;
   }
@@ -650,14 +1055,25 @@ void loop() {
     lastActionMs = millis();
   }
 
+  // Watchdog: never let voice/latch stay engaged forever (e.g. forgotten latch,
+  // or a lost release). Auto-release after a max hold so it always returns to idle.
+  if (voiceKeyDown && millis() - voiceStartMs > kMaxVoiceHoldMs) {
+    releaseVoiceShortcut();
+    clearYellowButtonGesture();
+  }
+
   if (millis() - lastActionMs > 1200 && !voiceKeyDown) {
     setState(UiState::Ready);
   }
 
-  refreshReadyStatusIndicator();
-  drawStatusIndicator();
-  drawAnimationFrame();
-  drawBatteryIndicator();
   updatePowerSaving();
+  if (displayAsleep) {
+    drawSleepClock();
+  } else {
+    refreshReadyStatusIndicator();
+    drawStatusIndicator();
+    drawAnimationFrame();
+    drawBatteryIndicator();
+  }
   delay(20);
 }
