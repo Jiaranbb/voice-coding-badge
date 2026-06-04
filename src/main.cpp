@@ -6,6 +6,9 @@
 #include "usagi_animations.h"
 #include "clock_font.h"
 #include "weather_icons.h"
+#include "midi_player.h"
+#include "ha_audio.h"
+#include <esp_system.h>
 #include <NimBLEDevice.h>
 
 // ---- Weather pushed from the Mac over a custom BLE characteristic ----
@@ -110,6 +113,7 @@ enum class UiState {
   VoiceKeyHeld,
   Sent,
   Cancelled,
+  PetAction,
   TestMode
 };
 
@@ -164,6 +168,7 @@ static int16_t lastReportedBleBatteryLevel = -1;
 static uint16_t activeLabelRevealMs = 0;
 static uint16_t lastLabelVisibleWidth = 0;
 static bool activeLabelLoops = false;
+static bool petTouchArmed = true;
 
 constexpr uint32_t kVoiceCommitDelayMs = 1100;
 constexpr uint32_t kVoiceSendDelayMs = kVoiceCommitDelayMs;
@@ -179,6 +184,7 @@ constexpr uint32_t kBatteryRefreshMs = 5000;
 constexpr uint32_t kVoiceHoldStartMs = 180;
 constexpr uint32_t kVoiceDoubleClickMs = 420;
 constexpr uint32_t kMaxVoiceHoldMs = 30000;  // watchdog: auto-release voice/latch so it can never stick
+constexpr uint32_t kPetTouchActionMs = 1200;
 constexpr uint8_t kActiveBrightness = 120;
 constexpr uint8_t kDimBrightness = 45;
 constexpr uint8_t kLowBatteryLevel = 20;
@@ -195,6 +201,7 @@ constexpr uint16_t kBatteryYellow = 0xFFE0;
 constexpr int32_t kLabelY = 30;
 constexpr int32_t kVoiceMeterY = 32;
 constexpr int32_t kPetY = 98;
+constexpr int32_t kPetTouchPadding = 16;
 constexpr int32_t kStatusAreaH = 92;
 constexpr uint16_t kReadyLabelRevealMs = 1800;
 
@@ -209,6 +216,10 @@ void buzzPattern(uint8_t count) {
     buzz(120, 45);
     delay(65);
   }
+}
+
+void playWaitingCue() {
+  MidiPlayer::playSample(HaAudio::kSamples, HaAudio::kSampleCount, HaAudio::kSampleRate);
 }
 
 void drawStage() {
@@ -579,6 +590,7 @@ void drawSleepClock(bool force = false) {
 // a low-brightness always-on clock instead of going fully dark.
 void enterDisplaySleep() {
   if (displayAsleep) return;
+  MidiPlayer::stop();
   displayAsleep = true;
   sleepEnterMs = millis();
   lastDrawnClockHm = -1;        // force a fresh clock draw
@@ -697,6 +709,7 @@ void showVoiceState() {
 
 void setState(UiState state) {
   if (state == currentState && activeClip != nullptr) return;
+  MidiPlayer::stop();
   currentState = state;
 
   switch (state) {
@@ -713,15 +726,57 @@ void setState(UiState state) {
       showVoiceState();
       break;
     case UiState::Sent:
-      showAnimatedState(UsagiAnimations::waiting, &UsagiAnimations::labelSent);
+      showAnimatedState(UsagiAnimations::sent, &UsagiAnimations::labelSent);
       break;
     case UiState::Cancelled:
       showAnimatedState(UsagiAnimations::failed, &UsagiAnimations::labelCancelled);
+      break;
+    case UiState::PetAction:
+      if (esp_random() & 1) {
+        showAnimatedState(UsagiAnimations::waiting);
+        playWaitingCue();
+      } else {
+        showAnimatedState(UsagiAnimations::failed);
+      }
       break;
     case UiState::TestMode:
       showAnimatedState(UsagiAnimations::idle);
       break;
   }
+}
+
+bool isTouchInsidePet(int16_t x, int16_t y) {
+  if (activeClip == nullptr) return false;
+
+  const int32_t petX = (M5.Display.width() - activeClip->width) / 2;
+  const int32_t left = petX - kPetTouchPadding;
+  const int32_t right = petX + activeClip->width + kPetTouchPadding;
+  const int32_t top = kPetY - kPetTouchPadding;
+  const int32_t bottom = kPetY + activeClip->height + kPetTouchPadding;
+  return x >= left && x <= right && y >= top && y <= bottom;
+}
+
+void handleReadyPetTouch() {
+  if (currentState != UiState::Ready || voiceKeyDown || pendingSendAfterVoice ||
+      displayAsleep || M5.Display.touch() == nullptr) {
+    return;
+  }
+
+  m5gfx::touch_point_t touchPoint;
+  const bool touching = M5.Display.getTouch(&touchPoint, 1) > 0;
+  if (!touching) {
+    petTouchArmed = true;
+    return;
+  }
+
+  if (!petTouchArmed || !isTouchInsidePet(touchPoint.x, touchPoint.y)) {
+    return;
+  }
+
+  petTouchArmed = false;
+  noteUserActivity();
+  lastActionMs = millis();
+  setState(UiState::PetAction);
 }
 
 void tapKey(uint8_t key) {
@@ -756,6 +811,7 @@ void typeTestText() {
 void pressVoiceShortcut(uint8_t buzzCount = 1) {
   if (!bleKeyboard.isConnected() || voiceKeyDown) return;
 
+  MidiPlayer::stop();
   // WeChat Input voice input is configured on this Mac as the right Option (Alt) key.
   bleKeyboard.press(KEY_RIGHT_ALT);
   voiceKeyDown = true;
@@ -944,11 +1000,13 @@ void applyPendingTime() {
 void setup() {
   auto cfg = M5.config();
   cfg.serial_baudrate = 115200;
+  cfg.internal_spk = true;
   M5.begin(cfg);
   Serial.begin(115200);
   Serial.println("[VoiceBadge] boot");
   M5.Display.setRotation(0);
   M5.Display.setBrightness(kActiveBrightness);
+  MidiPlayer::begin();
   lastUserActivityMs = millis();
 
   setState(UiState::Booting);
@@ -972,6 +1030,7 @@ void setup() {
 
 void loop() {
   M5.update();
+  MidiPlayer::update();
   applyPendingTime();
 
   const bool bleConnected = bleKeyboard.isConnected();
@@ -1069,6 +1128,7 @@ void loop() {
 
   handleYellowButton();
   updatePendingSendAfterVoice();
+  handleReadyPetTouch();
 
   if (M5.BtnB.wasHold()) {
     noteUserActivity();
@@ -1117,7 +1177,9 @@ void loop() {
     clearYellowButtonGesture();
   }
 
-  if (millis() - lastActionMs > 1200 && !voiceKeyDown) {
+  const uint32_t actionReturnMs =
+      currentState == UiState::PetAction ? kPetTouchActionMs : 1200;
+  if (millis() - lastActionMs > actionReturnMs && !voiceKeyDown) {
     setState(UiState::Ready);
   }
 

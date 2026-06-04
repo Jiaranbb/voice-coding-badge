@@ -6,6 +6,7 @@ from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 
 SOURCE_ROOT = Path("/Users/cathy/work/writing/pet-runs/usachi-build/frames")
+ASSET_CLIP_ROOT = Path("assets/usagi")
 OUT_HEADER = Path("src/usagi_animations.h")
 OUT_CPP = Path("src/usagi_animations.cpp")
 TARGET_SIZE = (280, 303)
@@ -17,6 +18,11 @@ VOICE_METER_SIZE = (166, 46)
 VOICE_METER_SCALE = 4
 MIC_ICON_PATH = Path(os.environ.get("MIC_ICON_PATH", "assets/mic.png"))
 MIC_ICON_TARGET_HEIGHT = 40
+PET_SPRITESHEET_PATH = Path(
+    os.environ.get("PET_SPRITESHEET_PATH", "/Users/cathy/.codex/pets/usagi/spritesheet.webp"))
+PET_CELL_SIZE = (192, 208)
+PET_WAITING_ROW = 6
+PET_WAITING_FRAME_COUNT = 6
 
 LABELS = {
     "ready": {"text": "……", "font_size": 34},
@@ -27,9 +33,10 @@ LABELS = {
 CLIPS = {
     "idle": {"frame_ms": 180},
     "running": {"frame_ms": 140},
-    "jumping": {"frame_ms": 140},
-    "waiting": {"frame_ms": 150},
-    "failed": {"frame_ms": 150},
+    "jumping": {"frame_ms": 140, "copy_from": "running"},
+    "waiting": {"frame_ms": 150, "asset_dir": "waiting"},
+    "sent": {"frame_ms": 150, "asset_dir": "sent"},
+    "failed": {"frame_ms": 150, "asset_dir": "failed"},
 }
 
 
@@ -37,8 +44,46 @@ def rgb565(r: int, g: int, b: int) -> int:
     return ((r & 0xF8) << 8) | ((g & 0xF8) << 3) | (b >> 3)
 
 
+def is_green_fringe_pixel(r: int, g: int, b: int, a: int) -> bool:
+    return (
+        a > 0
+        and g >= 70
+        and g >= max(r, b) + 24
+        and g >= r * 1.25
+        and g >= b * 1.25
+    )
+
+
+def remove_green_fringe(image: Image.Image) -> Image.Image:
+    rgba = image.convert("RGBA")
+    pixels = []
+    for r, g, b, a in rgba.getdata():
+        if is_green_fringe_pixel(r, g, b, a):
+            pixels.append((0, 0, 0, 0))
+        else:
+            pixels.append((r, g, b, a))
+    rgba.putdata(pixels)
+    return rgba
+
+
 def frame_values(path: Path) -> tuple[int, int, list[int]]:
-    image = Image.open(path).convert("RGBA").resize(TARGET_SIZE, Image.Resampling.LANCZOS)
+    image = remove_green_fringe(Image.open(path)).resize(TARGET_SIZE, Image.Resampling.LANCZOS)
+    return image_values(image)
+
+
+def waiting_frame_images_from_pet() -> list[Image.Image]:
+    spritesheet = Image.open(PET_SPRITESHEET_PATH).convert("RGBA")
+    cell_w, cell_h = PET_CELL_SIZE
+    y0 = PET_WAITING_ROW * cell_h
+    frames: list[Image.Image] = []
+    for index in range(PET_WAITING_FRAME_COUNT):
+        x0 = index * cell_w
+        frames.append(spritesheet.crop((x0, y0, x0 + cell_w, y0 + cell_h)))
+    return frames
+
+
+def frame_values_from_image(image: Image.Image) -> tuple[int, int, list[int]]:
+    image = remove_green_fringe(image).resize(TARGET_SIZE, Image.Resampling.LANCZOS)
     width, height = image.size
     values: list[int] = []
 
@@ -188,6 +233,7 @@ extern const UsagiAnimationClip idle;
 extern const UsagiAnimationClip running;
 extern const UsagiAnimationClip jumping;
 extern const UsagiAnimationClip waiting;
+extern const UsagiAnimationClip sent;
 extern const UsagiAnimationClip failed;
 
 extern const UsagiStatusLabel labelReady;
@@ -207,20 +253,47 @@ def write_cpp() -> None:
         "namespace UsagiAnimations {\n\n",
     ]
 
+    generated_clips: dict[str, tuple[list[str], int, int]] = {}
+
     for clip_name, config in CLIPS.items():
-        frame_paths = sorted((SOURCE_ROOT / clip_name).glob("*.png"))
-        if not frame_paths:
+        copy_from = config.get("copy_from")
+        if copy_from is not None:
+            if copy_from not in generated_clips:
+                raise RuntimeError(f"Cannot copy frames from unknown clip {copy_from}")
+            source_symbols, width, height = generated_clips[copy_from]
+            chunks.append(f"const uint16_t* const {clip_name}_frames[] PROGMEM = {{\n")
+            chunks.append("  " + ", ".join(source_symbols) + "\n")
+            chunks.append("};\n\n")
+            chunks.append(
+                f"const UsagiAnimationClip {clip_name} = "
+                f"{{{clip_name}_frames, {len(source_symbols)}, {width}, {height}, {config['frame_ms']}}};\n\n"
+            )
+            generated_clips[clip_name] = (source_symbols, width, height)
+            continue
+
+        asset_dir = config.get("asset_dir")
+        if asset_dir is not None:
+            frame_sources = sorted((ASSET_CLIP_ROOT / asset_dir).glob("*.png"))
+        elif clip_name == "waiting" and PET_SPRITESHEET_PATH.exists():
+            frame_sources = waiting_frame_images_from_pet()
+        else:
+            frame_sources = sorted((SOURCE_ROOT / clip_name).glob("*.png"))
+
+        if not frame_sources:
             raise RuntimeError(f"No frames found for {clip_name}")
 
         width = height = None
         frame_symbols: list[str] = []
 
-        for index, path in enumerate(frame_paths):
-            frame_width, frame_height, values = frame_values(path)
+        for index, source in enumerate(frame_sources):
+            if isinstance(source, Image.Image):
+                frame_width, frame_height, values = frame_values_from_image(source)
+            else:
+                frame_width, frame_height, values = frame_values(source)
             width = width or frame_width
             height = height or frame_height
             if width != frame_width or height != frame_height:
-                raise RuntimeError(f"Inconsistent frame size in {clip_name}: {path}")
+                raise RuntimeError(f"Inconsistent frame size in {clip_name}")
 
             symbol = f"{clip_name}_{index:02d}"
             frame_symbols.append(symbol)
@@ -235,6 +308,7 @@ def write_cpp() -> None:
             f"const UsagiAnimationClip {clip_name} = "
             f"{{{clip_name}_frames, {len(frame_symbols)}, {width}, {height}, {config['frame_ms']}}};\n\n"
         )
+        generated_clips[clip_name] = (frame_symbols, width, height)
 
     for label_name, config in LABELS.items():
         width, height, values = image_values(label_image(config["text"], config["font_size"]))

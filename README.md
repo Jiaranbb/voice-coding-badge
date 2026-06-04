@@ -13,6 +13,7 @@ The badge does not act as a microphone. It behaves like a Bluetooth keyboard and
 - Blue button B long press: if voice input is active, stop dictation and send `Cmd + Z` to undo the newly inserted text. If voice input ended recently, long press also sends `Cmd + Z` within an 8-second window. Otherwise it sends `Esc`. Cancel keeps the triple-vibration feedback.
 - Hold blue button B while booting: enter test mode. In test mode, yellow button A types `voice badge test` to confirm that the BLE keyboard link is working.
 - Yellow button A + blue button B pressed together: manually toggle the sleep clock on or off, with one vibration as confirmation.
+- Touch Usagi while Ready: play a random `waiting` or `failed` animation without sending any keyboard input or vibration.
 
 The red power button is connected to the PMIC and is not readable by the firmware. It still handles the StopWatch's hardware power behavior: quick double press to power off, long press/reset behavior as defined by the device.
 
@@ -32,7 +33,7 @@ The screen shows a centered Usagi animation and a compact top status indicator.
 - Pairing: Usagi `jumping`
 - Ready: Usagi `idle`, with slow animated dots at the top. Charging or low battery replaces the dots with centered battery status.
 - Voice input: Usagi `running`, with a white microphone and animated bars at the top.
-- Sent: Usagi `waiting`, with the sent status label.
+- Sent: Usagi `sent`, with the sent status label.
 - Cancelled/undo: Usagi `failed`, with the cancel status label.
 
 Generated animation assets are committed in `src/usagi_animations.*`. The helper script is `tools/generate_usagi_assets.py`.

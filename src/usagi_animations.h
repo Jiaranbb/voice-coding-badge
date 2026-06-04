@@ -29,6 +29,7 @@ extern const UsagiAnimationClip idle;
 extern const UsagiAnimationClip running;
 extern const UsagiAnimationClip jumping;
 extern const UsagiAnimationClip waiting;
+extern const UsagiAnimationClip sent;
 extern const UsagiAnimationClip failed;
 
 extern const UsagiStatusLabel labelReady;

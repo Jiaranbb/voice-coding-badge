@@ -1,0 +1,11 @@
+source=/Users/cathy/Downloads/ha.mp4
+wav_sample_rate=16000
+output=/Users/cathy/work/skill/stopwatch-voice-badge/assets/ha.mid
+bpm=120
+ppq=480
+note_count=4
+notes:
+  0.000s-0.270s  midi=62  name= D4  velocity=118
+  0.270s-0.340s  midi=64  name= E4  velocity=109
+  0.340s-0.440s  midi=66  name=F#4  velocity=113
+  0.440s-0.500s  midi=68  name=G#4  velocity=108
