@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 from pathlib import Path
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont
@@ -14,7 +15,7 @@ LABEL_PAD_X = 10
 LABEL_COLOR = (255, 255, 255, 255)
 VOICE_METER_SIZE = (166, 46)
 VOICE_METER_SCALE = 4
-MIC_ICON_PATH = Path("/Users/cathy/Downloads/话筒 (1).png")
+MIC_ICON_PATH = Path(os.environ.get("MIC_ICON_PATH", "assets/mic.png"))
 MIC_ICON_TARGET_HEIGHT = 40
 
 LABELS = {

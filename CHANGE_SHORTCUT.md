@@ -1,10 +1,10 @@
-# VoiceBadge 改快捷键和刷固件说明
+# Change Shortcuts and Flash Firmware
 
-当前固件把 Badge 做成一个 BLE 蓝牙键盘。
+The current firmware makes the badge act as a BLE keyboard.
 
-## 改语音触发快捷键
+## Change the Voice Shortcut
 
-语音触发快捷键在 `src/main.cpp` 里：
+The voice shortcut is defined in `src/main.cpp`:
 
 ```cpp
 void pressVoiceShortcut(uint8_t buzzCount = 1) {
@@ -20,60 +20,60 @@ void releaseVoiceShortcut() {
 }
 ```
 
-如果微信输入法「按住说话」设置为单独 `左 Ctrl`，不用改。
+If your input method uses only `Left Ctrl` for push-to-talk, no change is needed.
 
-如果要改成 `左 Shift + 左 Ctrl`，把上面两处改成：
+If you want to use `Left Shift + Left Ctrl`, change the press logic to:
 
 ```cpp
 bleKeyboard.press(KEY_LEFT_SHIFT);
 bleKeyboard.press(KEY_LEFT_CTRL);
 ```
 
-以及：
+And change the release logic to:
 
 ```cpp
 bleKeyboard.release(KEY_LEFT_SHIFT);
 bleKeyboard.release(KEY_LEFT_CTRL);
 ```
 
-常用键名在 `BleKeyboard.h` 里，包括：
+Common key constants include:
 
 - `KEY_LEFT_CTRL`
 - `KEY_LEFT_SHIFT`
 - `KEY_LEFT_ALT`
-- `KEY_LEFT_GUI`，也就是 Mac 的 Command
+- `KEY_LEFT_GUI`, which is Command on macOS
 - `KEY_RETURN`
 - `KEY_ESC`
 
-## 编译
+## Build
 
-需要先安装 PlatformIO。进入项目目录后运行：
+Install PlatformIO, then run:
 
 ```bash
 platformio run
 ```
 
-## 刷入 StopWatch
+## Flash the StopWatch
 
-用 USB-C 连接 Badge，然后查看串口：
+Connect the badge over USB-C, then list serial ports:
 
 ```bash
 platformio device list
 ```
 
-刷入：
+Flash:
 
 ```bash
 platformio run -t upload --upload-port /dev/cu.usbmodem14201
 ```
 
-如果串口不是 `/dev/cu.usbmodem14201`，换成 `platformio device list` 里看到的 USB 串口。
+If your port is different, replace `/dev/cu.usbmodem14201` with the USB serial port shown by `platformio device list`.
 
-## 使用
+## Use
 
-- 开机：短按电源键一次
-- 关机：快速双击电源键
-- 黄键 A：按住说话
-- 黄键 A 双击：免按住说话
-- 蓝键 B 短按：发送
-- 蓝键 B 长按：取消/撤销
+- Power on: short press the power button once.
+- Power off: quick double press the power button.
+- Yellow button A: hold to speak.
+- Yellow button A double click: hands-free voice mode.
+- Blue button B short press: send.
+- Blue button B long press: cancel or undo.
