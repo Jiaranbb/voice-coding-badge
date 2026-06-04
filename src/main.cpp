@@ -37,6 +37,29 @@ class WeatherCharCallbacks : public NimBLECharacteristicCallbacks {
 };
 static WeatherCharCallbacks gWeatherCallbacks;
 
+// Time pushed from the Mac (which always has the correct clock). The RTC on this
+// board loses time on power-off and can power up with garbage, so the Mac re-syncs
+// it over BLE. Parsed on the BLE task but applied from the main loop so all I2C
+// (RTC/IMU/PMIC) stays single-threaded.
+static int gTimeY, gTimeMo, gTimeD, gTimeH, gTimeMi, gTimeS, gTimeW;
+static volatile bool gTimePending = false;
+
+class TimeCharCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* c) override {
+    std::string v = c->getValue();  // "YYYY-MM-DD HH:MM:SS W" (W = 0 Sun .. 6 Sat)
+    int Y, Mo, D, H, Mi, S, W = 0;
+    if (sscanf(v.c_str(), "%d-%d-%d %d:%d:%d %d", &Y, &Mo, &D, &H, &Mi, &S, &W) >= 6 &&
+        Y >= 2024 && Mo >= 1 && Mo <= 12 && D >= 1 && D <= 31) {
+      portENTER_CRITICAL(&gWeatherMux);
+      gTimeY = Y; gTimeMo = Mo; gTimeD = D; gTimeH = H; gTimeMi = Mi; gTimeS = S; gTimeW = W;
+      gTimePending = true;
+      portEXIT_CRITICAL(&gWeatherMux);
+      Serial.printf("[Time] received %04d-%02d-%02d %02d:%02d:%02d\n", Y, Mo, D, H, Mi, S);
+    }
+  }
+};
+static TimeCharCallbacks gTimeCallbacks;
+
 // Forward declarations for the idle-sleep / raise-to-wake helpers, which are
 // defined after the drawing routines but referenced earlier.
 void wakeDisplay();
@@ -55,8 +78,11 @@ class DebugBleKeyboard : public BleKeyboard {
     NimBLECharacteristic* ch = svc->createCharacteristic(
         NimBLEUUID((uint16_t)0xFFF1), NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
     ch->setCallbacks(&gWeatherCallbacks);
+    NimBLECharacteristic* tch = svc->createCharacteristic(
+        NimBLEUUID((uint16_t)0xFFF2), NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+    tch->setCallbacks(&gTimeCallbacks);
     svc->start();
-    Serial.println("[Weather] GATT service 0xFFF0 / char 0xFFF1 ready");
+    Serial.println("[Weather] GATT 0xFFF0 ready (weather 0xFFF1 / time 0xFFF2)");
   }
 
   void onConnect(BLEServer* pServer) override {
@@ -867,7 +893,11 @@ void initClockSource() {
     return;
   }
   const auto d = M5.Rtc.getDate();
-  if (d.year < 2025) {
+  // Re-seed when the RTC is unset OR holds garbage (power-up junk like year 2084,
+  // month 0). The Mac re-syncs the real time over BLE shortly after, anyway.
+  const bool bad = d.year < 2024 || d.year > 2099 || d.month < 1 || d.month > 12 ||
+                   d.date < 1 || d.date > 31;
+  if (bad) {
     struct tm bt = {};
     bt.tm_year = BUILD_BJ_YEAR - 1900;
     bt.tm_mon = BUILD_BJ_MON - 1;
@@ -877,7 +907,7 @@ void initClockSource() {
     bt.tm_sec = BUILD_BJ_SEC;
     bt.tm_wday = BUILD_BJ_WDAY;
     M5.Rtc.setDateTime(&bt);
-    Serial.printf("[VoiceBadge] RTC was unset; seeded Beijing time %04d-%02d-%02d %02d:%02d:%02d\n",
+    Serial.printf("[VoiceBadge] RTC invalid; seeded Beijing time %04d-%02d-%02d %02d:%02d:%02d\n",
                   (int)BUILD_BJ_YEAR, (int)BUILD_BJ_MON, (int)BUILD_BJ_MDAY,
                   (int)BUILD_BJ_HOUR, (int)BUILD_BJ_MIN, (int)BUILD_BJ_SEC);
   }
@@ -885,6 +915,30 @@ void initClockSource() {
   Serial.printf("[VoiceBadge] RTC now (Beijing) %04d-%02d-%02d %02d:%02d:%02d wday=%d\n",
                 now.date.year, now.date.month, now.date.date, now.time.hours,
                 now.time.minutes, now.time.seconds, now.date.weekDay);
+}
+
+// Apply a time pushed from the Mac (from the main loop, so RTC I2C stays single
+// threaded). Keeps the clock correct even after a power-off RTC reset.
+void applyPendingTime() {
+  if (!gTimePending) return;
+  int Y, Mo, D, H, Mi, S, W;
+  portENTER_CRITICAL(&gWeatherMux);
+  Y = gTimeY; Mo = gTimeMo; D = gTimeD; H = gTimeH; Mi = gTimeMi; S = gTimeS; W = gTimeW;
+  gTimePending = false;
+  portEXIT_CRITICAL(&gWeatherMux);
+  if (!M5.Rtc.isEnabled()) return;
+  struct tm t = {};
+  t.tm_year = Y - 1900;
+  t.tm_mon = Mo - 1;
+  t.tm_mday = D;
+  t.tm_hour = H;
+  t.tm_min = Mi;
+  t.tm_sec = S;
+  t.tm_wday = (W >= 0 && W < 7) ? W : 0;
+  M5.Rtc.setDateTime(&t);
+  lastDrawnClockHm = -1;  // force the clock to redraw with the corrected time
+  gWeatherDirty = true;
+  Serial.printf("[Time] RTC set to %04d-%02d-%02d %02d:%02d:%02d\n", Y, Mo, D, H, Mi, S);
 }
 
 void setup() {
@@ -918,6 +972,7 @@ void setup() {
 
 void loop() {
   M5.update();
+  applyPendingTime();
 
   const bool bleConnected = bleKeyboard.isConnected();
   if (bleConnected && !lastBleConnected) {
