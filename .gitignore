@@ -2,3 +2,8 @@
 .pio/
 .vscode/
 compile_commands.json
+
+# Mac weather helper venv & python caches
+tools/weather-venv/
+__pycache__/
+*.pyc
