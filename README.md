@@ -1,67 +1,108 @@
 # VoiceBadge for M5Stack StopWatch
 
-这是 M5Stack StopWatch 的第一版 voice coding 电子吧唧固件。
+Firmware for turning an M5Stack StopWatch into a voice-coding BLE keyboard badge for macOS.
 
-目标：让 StopWatch 通过蓝牙连接 Mac，模拟一个键盘，用按键触发微信输入法语音输入。
+The badge does not act as a microphone. It behaves like a Bluetooth keyboard and sends shortcuts to the Mac. Speech recognition is handled by the Mac-side input method, such as WeChat Input.
 
-## 第一版按键
+## Current Button Behavior
 
-- 黄键 A：按住说话。按下约 0.18 秒后按住 `右 Option ⌥`，松开时释放。用于触发微信输入法「按住 ⌥ 说话」。
-- 黄键 A 双击：进入免按住说话模式，本质是模拟按住 `右 Option ⌥`；之后再点一次黄键结束听写。免按住说话时也可以直接短按蓝键 B，固件会先结束听写，等待约 1.1 秒让微信输入法上屏，再发送 `Enter`。
-- 蓝键 B 短按：发送 `Enter`，不震动。
-- 蓝键 B 长按：如果正在语音输入，先结束听写，再发送 `Cmd + Z` 撤销刚刚上屏的文字；如果刚刚结束过语音输入，8 秒内长按也会发送 `Cmd + Z`；其他情况下发送 `Esc`。取消时保留三连震动反馈。
-- 开机时按住蓝键 B：进入测试模式。测试模式下，黄键会输入 `voice badge test`，用于确认蓝牙键盘是否真的连上。
-- 自动省电：30 秒无按键操作后自动把屏幕亮度从 120 降到 45；任意按键或蓝牙重新连接会立刻恢复亮度。语音输入中不会自动降亮度。
-- 电量显示：只在充电中或低电量（20% 及以下）时显示，居中替换 Ready 状态顶部的 `……`；充电中会显示黄色闪电。电量约每 5 秒刷新一次。同时把真实电量通过 BLE 电池服务上报，macOS 蓝牙菜单会显示真实电量。
-- 息屏休眠：30 秒无操作降亮度，5 分钟无操作进入息屏（低亮度时钟，蓝牙保持连接，按键仍可用）。
-- 息屏时钟：息屏时不显示动画，只显示北京时间 `HH:MM` 和英文星期（如 `THU`）。时间在首次烧录时按 `Asia/Shanghai` 种入 RTC，之后由 RTC 走时。
-- 拿起唤醒：休眠时通过 IMU 检测到拿起/移动会自动亮屏；按任意键也会唤醒。
-- 手动息屏：黄键 + 蓝键**同时按一下**在息屏 / 唤醒之间切换（会震动一下确认）。红键（电源键）直连 PMIC、固件读不到，只负责双击关机 / 长按复位。
-- 蓝牙名称：`537VoiceCoding`。
+- BLE device name: `537VoiceCoding`.
+- Yellow button A hold: after about 0.18 seconds, hold `Right Option` and release it when the button is released. This is designed for WeChat Input push-to-talk voice input configured as "hold Option to speak".
+- Yellow button A double click: enter hands-free voice mode by holding `Right Option`; tap A again to stop dictation. In hands-free mode, a short press on blue button B also stops dictation, waits about 1.1 seconds for the text to appear, then sends `Enter`.
+- Blue button B short press: send `Enter`; no vibration.
+- Blue button B long press: if voice input is active, stop dictation and send `Cmd + Z` to undo the newly inserted text. If voice input ended recently, long press also sends `Cmd + Z` within an 8-second window. Otherwise it sends `Esc`. Cancel keeps the triple-vibration feedback.
+- Hold blue button B while booting: enter test mode. In test mode, yellow button A types `voice badge test` to confirm that the BLE keyboard link is working.
+- Yellow button A + blue button B pressed together: manually toggle the sleep clock on or off, with one vibration as confirmation.
 
-## Usagi 动画状态
+The red power button is connected to the PMIC and is not readable by the firmware. It still handles the StopWatch's hardware power behavior: quick double press to power off, long press/reset behavior as defined by the device.
 
-屏幕显示居中的 Usagi 大图动画，并在顶部显示一行状态符号。
+## Power, Battery, and Sleep
 
-- 蓝牙配对中：`jumping`
-- Ready：`idle`，顶部 `……` 慢速循环逐步显示；充电中或低电量时改为居中电量提示
-- 语音输入中：`running`，顶部显示白色麦克风和两侧动态竖条；麦克风图标来自 `/Users/cathy/Downloads/话筒 (1).png`
-- 发送成功：`waiting`，顶部 `٩(•̤̀ᵕ•̤́๑)ᵒᵏ`
-- 取消/撤销：`failed`，顶部 `?(˘•ω•˘)`
+- Auto dim: after 30 seconds without button activity, the screen brightness drops from 120 to 45. Any button press or BLE reconnect restores brightness. Voice input prevents auto dimming.
+- Battery status: shown only while charging or when the battery is 20% or lower. It replaces the Ready-state top dots and refreshes about every 5 seconds. Charging shows a yellow lightning icon.
+- BLE battery reporting: the firmware reports the real battery level through the BLE Battery Service, so macOS can show the badge battery level in the Bluetooth menu.
+- Sleep clock: after 5 minutes without activity, the display enters a low-brightness sleep clock. BLE stays connected and the buttons still work.
+- Sleep clock display: animation is hidden; the screen shows Beijing time in `HH:MM` format and an English weekday such as `THU`. The RTC is initialized at flash/build time using the `Asia/Shanghai` timezone and then keeps time on-device.
+- Raise to wake: while sleeping, the IMU detects pickup/movement and wakes the display. Any button press also wakes the display.
 
-动画素材来自本机 Codex 小宠物 `Usagi`，生成脚本在 `tools/generate_usagi_assets.py`。
+## Display States
 
-## Mac 端准备
+The screen shows a centered Usagi animation and a compact top status indicator.
 
-1. 安装并启用微信输入法。
-2. 打开微信输入法设置。
-3. 找到「语音输入」快捷键。
-4. 设置为「按住 `Option ⌥` 说话」，与固件保持一致。
-5. 打开一个可以输入文字的地方，例如备忘录或 Codex 输入框。
+- Pairing: Usagi `jumping`
+- Ready: Usagi `idle`, with slow animated dots at the top. Charging or low battery replaces the dots with centered battery status.
+- Voice input: Usagi `running`, with a white microphone and animated bars at the top.
+- Sent: Usagi `waiting`, with the sent status label.
+- Cancelled/undo: Usagi `failed`, with the cancel status label.
 
-## 连接测试
+Generated animation assets are committed in `src/usagi_animations.*`. The helper script is `tools/generate_usagi_assets.py`.
 
-1. 给 StopWatch 刷入本项目固件。
-2. 打开 macOS「系统设置」->「蓝牙」。
-3. 找到 `537VoiceCoding`。
-4. 点击连接。
-5. 第一次建议按住蓝键开机，进入测试模式。
-6. 打开备忘录，按黄键。
-7. 如果出现 `voice badge test`，说明蓝牙键盘链路正常。
+## Weather Push
 
-## 正常使用
+The StopWatch has no Wi-Fi in this firmware. Weather is pushed from the Mac over BLE through a custom characteristic.
 
-1. 打开 Codex、Claude Code 终端或任意文本输入框。
-2. 确认当前输入法是微信输入法。
-3. 把光标放进输入框。
-4. 按住黄键说话，松开黄键后微信输入法完成转写。
-5. 也可以双击黄键进入免按住说话模式，再点一次黄键结束听写。
-6. 短按蓝键发送。免按住说话时直接短按蓝键，会自动结束听写，等待约 1.1 秒后发送。
-7. 长按蓝键取消。语音中取消的实际行为是结束听写后撤销刚刚输入的文字；如果已经松开黄键，文字上屏后 8 秒内长按蓝键也可以撤销。
+Related files:
 
-## 开发来源
+- `tools/mac_weather_push.py`: fetches weather on the Mac and writes a compact payload to the badge.
+- `tools/com.voicebadge.weather.plist`: launchd example for running the weather push periodically.
+- `src/weather_icons.*`: weather icons used by the sleep clock.
 
-StopWatch 官方文档给出的 PlatformIO 配置使用：
+The helper uses the device name `537VoiceCoding` and writes to characteristic `0xFFF1`.
+
+## Mac Setup
+
+1. Install and enable WeChat Input.
+2. Open WeChat Input settings.
+3. Set the voice input push-to-talk shortcut to `Option`.
+4. Open any text field, such as Notes, Codex, Claude Code, or a terminal prompt.
+
+## Connection Test
+
+1. Flash this firmware to the StopWatch.
+2. Open macOS System Settings -> Bluetooth.
+3. Find `537VoiceCoding`.
+4. Connect it.
+5. For the first test, boot while holding blue button B to enter test mode.
+6. Open Notes and press yellow button A.
+7. If `voice badge test` appears, the BLE keyboard link is working.
+
+## Normal Use
+
+1. Open Codex, Claude Code, a terminal, or any other text input target.
+2. Make sure WeChat Input is active.
+3. Put the cursor in the text field.
+4. Hold yellow button A to speak; release it to finish dictation.
+5. You can also double click yellow button A for hands-free voice mode, then tap A again to finish.
+6. Short press blue button B to send. In hands-free voice mode, short pressing B stops dictation first, waits about 1.1 seconds, then sends.
+7. Long press blue button B to cancel/undo. During voice input, cancel stops dictation and then undoes the newly inserted text. If text has already appeared, long press B can still undo it within about 8 seconds.
+
+## Build
+
+Install PlatformIO, then run:
+
+```bash
+platformio run
+```
+
+## Flash
+
+Connect the StopWatch over USB-C, then check the serial port:
+
+```bash
+platformio device list
+```
+
+Flash the firmware:
+
+```bash
+platformio run -t upload --upload-port /dev/cu.usbmodem14201
+```
+
+If your serial port is different, replace `/dev/cu.usbmodem14201` with the port shown by `platformio device list`.
+
+## Dependencies
+
+This project uses the PlatformIO configuration from the M5Stack StopWatch documentation:
 
 - `platform = espressif32 @ 6.12.0`
 - `board = esp32s3box`
@@ -71,4 +112,4 @@ StopWatch 官方文档给出的 PlatformIO 配置使用：
 - `M5PM1`
 - `M5IOE1`
 
-本项目额外使用 `ESP32 BLE Keyboard` 库，把 StopWatch 变成蓝牙键盘。
+It also uses `ESP32 BLE Keyboard` and `NimBLE-Arduino`.

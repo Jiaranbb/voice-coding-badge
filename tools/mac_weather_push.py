@@ -24,7 +24,7 @@ CHAR_UUID = "0000fff1-0000-1000-8000-00805f9b34fb"  # 0xFFF1
 SHORTCUT_NAME = "VBWeather"
 # Fallback location for wttr.in if the Shortcut isn't set up and the Mac's own
 # CoreLocation can't be read (e.g. background launchd run): Binjiang, Hangzhou.
-FALLBACK_LOCATION = "30.2084,120.2107"  # 杭州滨江
+FALLBACK_LOCATION = "30.2084,120.2107"  # Hangzhou Binjiang
 
 # Map wttr.in condition text -> device condition code.
 # 0 clear, 1 partly cloudy, 2 cloudy, 3 rain, 4 snow, 5 thunderstorm, 6 fog
@@ -115,7 +115,7 @@ def fetch_wttr(loc):
 
 def fetch_weather():
     loc = get_mac_location() or FALLBACK_LOCATION
-    source = "mac-location" if loc != FALLBACK_LOCATION else "fallback(杭州滨江)"
+    source = "mac-location" if loc != FALLBACK_LOCATION else "fallback(Hangzhou Binjiang)"
     lat, lon = (p.strip() for p in loc.split(","))
     r = fetch_open_meteo(lat, lon)
     if r:
