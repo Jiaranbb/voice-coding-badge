@@ -8,6 +8,7 @@ timer (see com.voicebadge.weather.plist) every ~15 minutes.
 Deps: pip3 install bleak   (CoreBluetooth on macOS)
 """
 import asyncio
+import datetime
 import json
 import re
 import sys
@@ -18,13 +19,14 @@ import urllib.request
 from bleak import BleakScanner, BleakClient
 
 DEVICE_NAME = "537VoiceCoding"
-CHAR_UUID = "0000fff1-0000-1000-8000-00805f9b34fb"  # 0xFFF1
+WEATHER_CHAR_UUID = "0000fff1-0000-1000-8000-00805f9b34fb"  # 0xFFF1
+TIME_CHAR_UUID = "0000fff2-0000-1000-8000-00805f9b34fb"     # 0xFFF2 (RTC sync)
 # Primary source: a macOS Shortcut that returns "<temp>|<conditions>" from the
 # system Weather (WeatherKit, same as the Weather app). Most accurate + no key.
 SHORTCUT_NAME = "VBWeather"
 # Fallback location for wttr.in if the Shortcut isn't set up and the Mac's own
 # CoreLocation can't be read (e.g. background launchd run): Binjiang, Hangzhou.
-FALLBACK_LOCATION = "30.2084,120.2107"  # Hangzhou Binjiang
+FALLBACK_LOCATION = "30.2084,120.2107"  # 杭州滨江
 
 # Map wttr.in condition text -> device condition code.
 # 0 clear, 1 partly cloudy, 2 cloudy, 3 rain, 4 snow, 5 thunderstorm, 6 fog
@@ -115,7 +117,7 @@ def fetch_wttr(loc):
 
 def fetch_weather():
     loc = get_mac_location() or FALLBACK_LOCATION
-    source = "mac-location" if loc != FALLBACK_LOCATION else "fallback(Hangzhou Binjiang)"
+    source = "mac-location" if loc != FALLBACK_LOCATION else "fallback(杭州滨江)"
     lat, lon = (p.strip() for p in loc.split(","))
     r = fetch_open_meteo(lat, lon)
     if r:
@@ -126,21 +128,32 @@ def fetch_weather():
     return r
 
 
-async def push(payload: str) -> bool:
+async def push(weather_payload: str, time_payload: str) -> bool:
     dev = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=15)
     if not dev:
         print(f"[weather] device '{DEVICE_NAME}' not found (advertising?)", file=sys.stderr)
         return False
     async with BleakClient(dev) as client:
-        await client.write_gatt_char(CHAR_UUID, payload.encode(), response=False)
-    print(f"[weather] pushed '{payload}' to {DEVICE_NAME}")
+        await client.write_gatt_char(WEATHER_CHAR_UUID, weather_payload.encode(), response=False)
+        if time_payload:
+            await client.write_gatt_char(TIME_CHAR_UUID, time_payload.encode(), response=False)
+    print(f"[push] weather='{weather_payload}' time='{time_payload}' -> {DEVICE_NAME}")
     return True
+
+
+def beijing_time_payload():
+    # "YYYY-MM-DD HH:MM:SS W" with W = 0 Sun .. 6 Sat, so the watch RTC self-corrects.
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
+    except Exception:
+        now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+    return now.strftime("%Y-%m-%d %H:%M:%S ") + str(now.isoweekday() % 7)
 
 
 def main():
     temp, cond = fetch_weather()
-    payload = f"{temp}|{cond}"
-    ok = asyncio.run(push(payload))
+    ok = asyncio.run(push(f"{temp}|{cond}", beijing_time_payload()))
     sys.exit(0 if ok else 1)
 
 
