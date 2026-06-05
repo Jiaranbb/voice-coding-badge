@@ -16,6 +16,8 @@ See `CHANGELOG.md` for update history.
 - Hold blue button B while booting: enter test mode. In test mode, yellow button A types `voice badge test` to confirm that the BLE keyboard link is working.
 - Yellow button A + blue button B pressed together: manually toggle the sleep clock on or off, with one vibration as confirmation.
 - Touch Usagi while Ready: play a random `waiting` or `waiting2` animation with its paired PCM sound, without sending any keyboard input or vibration.
+- Hold and swipe Usagi left while Ready: loop `running-left` until release, without sending keyboard input or vibration.
+- Hold and swipe Usagi right while Ready: loop `running-right` until release, without sending keyboard input or vibration.
 
 The red power button is connected to the PMIC and is not readable by the firmware. It still handles the StopWatch's hardware power behavior: quick double press to power off, long press/reset behavior as defined by the device.
 
@@ -37,7 +39,7 @@ The screen shows a centered Usagi animation and a compact top status indicator.
 - Voice input: Usagi `running`, with a white microphone and animated bars at the top.
 - Sent: Usagi `sent`, with the sent status label.
 - Cancelled/undo: Usagi `failed`, with the cancel status label.
-- Ready touch action: Usagi `waiting` or `waiting2`, each with its paired PCM sound.
+- Ready touch action: tap Usagi for `waiting` or `waiting2`, swipe left for `running-left`, or swipe right for `running-right`.
 
 Generated animation assets are committed in `src/usagi_animations.*`. The helper script is `tools/generate_usagi_assets.py`.
 

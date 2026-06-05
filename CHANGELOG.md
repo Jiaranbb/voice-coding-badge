@@ -17,4 +17,7 @@
   - byte-swap state is reset after image pushes;
   - the display panel is periodically reasserted and redrawn while dimmed and
     idle to recover from rare blue-tint or shifted-image glitches.
+- Added Ready-state Usagi swipe gestures:
+  - hold and swipe left to loop `running-left` until release;
+  - hold and swipe right to loop `running-right` until release.
 - Verified the firmware with `platformio run` and on-device USB flashing.

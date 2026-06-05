@@ -33,6 +33,8 @@ LABELS = {
 CLIPS = {
     "idle": {"frame_ms": 180},
     "running": {"frame_ms": 140},
+    "runningLeft": {"frame_ms": 150, "asset_dir": "running-left"},
+    "runningRight": {"frame_ms": 150, "asset_dir": "running-right"},
     "jumping": {"frame_ms": 140, "copy_from": "running"},
     "waiting": {"frame_ms": 150, "asset_dir": "waiting"},
     "sent": {"frame_ms": 150, "asset_dir": "sent"},
@@ -232,6 +234,8 @@ struct UsagiStatusAnimation {
 namespace UsagiAnimations {
 extern const UsagiAnimationClip idle;
 extern const UsagiAnimationClip running;
+extern const UsagiAnimationClip runningLeft;
+extern const UsagiAnimationClip runningRight;
 extern const UsagiAnimationClip jumping;
 extern const UsagiAnimationClip waiting;
 extern const UsagiAnimationClip sent;

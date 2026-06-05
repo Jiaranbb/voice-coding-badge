@@ -27,6 +27,8 @@ struct UsagiStatusAnimation {
 namespace UsagiAnimations {
 extern const UsagiAnimationClip idle;
 extern const UsagiAnimationClip running;
+extern const UsagiAnimationClip runningLeft;
+extern const UsagiAnimationClip runningRight;
 extern const UsagiAnimationClip jumping;
 extern const UsagiAnimationClip waiting;
 extern const UsagiAnimationClip sent;

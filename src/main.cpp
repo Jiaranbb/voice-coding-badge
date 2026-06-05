@@ -115,6 +115,8 @@ enum class UiState {
   Sent,
   Cancelled,
   PetAction,
+  PetSwipeLeft,
+  PetSwipeRight,
   TestMode
 };
 
@@ -171,6 +173,10 @@ static uint16_t activeLabelRevealMs = 0;
 static uint16_t lastLabelVisibleWidth = 0;
 static bool activeLabelLoops = false;
 static bool petTouchArmed = true;
+static bool petTouchActive = false;
+static bool petGestureConsumed = false;
+static int16_t petTouchStartX = 0;
+static int16_t petTouchStartY = 0;
 
 constexpr uint32_t kVoiceCommitDelayMs = 1100;
 constexpr uint32_t kVoiceSendDelayMs = kVoiceCommitDelayMs;
@@ -188,6 +194,8 @@ constexpr uint32_t kVoiceHoldStartMs = 180;
 constexpr uint32_t kVoiceDoubleClickMs = 420;
 constexpr uint32_t kMaxVoiceHoldMs = 30000;  // watchdog: auto-release voice/latch so it can never stick
 constexpr uint32_t kPetTouchActionMs = 1200;
+constexpr int16_t kPetSwipeMinDx = 54;
+constexpr int16_t kPetSwipeMaxDy = 96;
 constexpr uint8_t kActiveBrightness = 120;
 constexpr uint8_t kDimBrightness = 45;
 constexpr uint8_t kLowBatteryLevel = 20;
@@ -785,10 +793,20 @@ void setState(UiState state) {
         playWaiting2Cue();
       }
       break;
+    case UiState::PetSwipeLeft:
+      showAnimatedState(UsagiAnimations::runningLeft);
+      break;
+    case UiState::PetSwipeRight:
+      showAnimatedState(UsagiAnimations::runningRight);
+      break;
     case UiState::TestMode:
       showAnimatedState(UsagiAnimations::idle);
       break;
   }
+}
+
+bool isPetSwipeState() {
+  return currentState == UiState::PetSwipeLeft || currentState == UiState::PetSwipeRight;
 }
 
 bool isTouchInsidePet(int16_t x, int16_t y) {
@@ -803,26 +821,68 @@ bool isTouchInsidePet(int16_t x, int16_t y) {
 }
 
 void handleReadyPetTouch() {
-  if (currentState != UiState::Ready || voiceKeyDown || pendingSendAfterVoice ||
+  if ((currentState != UiState::Ready && !isPetSwipeState()) || voiceKeyDown || pendingSendAfterVoice ||
       displayAsleep || M5.Display.touch() == nullptr) {
     return;
   }
 
   m5gfx::touch_point_t touchPoint;
   const bool touching = M5.Display.getTouch(&touchPoint, 1) > 0;
+
+  if (isPetSwipeState()) {
+    if (touching) {
+      noteUserActivity();
+      return;
+    }
+
+    petTouchArmed = false;
+    petTouchActive = false;
+    petGestureConsumed = false;
+    setState(UiState::Ready);
+    return;
+  }
+
   if (!touching) {
-    petTouchArmed = true;
+    if (petTouchActive && !petGestureConsumed && petTouchArmed) {
+      petTouchArmed = false;
+      noteUserActivity();
+      lastActionMs = millis();
+      setState(UiState::PetAction);
+    } else {
+      petTouchArmed = true;
+    }
+    petTouchActive = false;
+    petGestureConsumed = false;
     return;
   }
 
-  if (!petTouchArmed || !isTouchInsidePet(touchPoint.x, touchPoint.y)) {
+  if (!petTouchActive) {
+    if (!petTouchArmed || !isTouchInsidePet(touchPoint.x, touchPoint.y)) {
+      return;
+    }
+    petTouchActive = true;
+    petGestureConsumed = false;
+    petTouchStartX = touchPoint.x;
+    petTouchStartY = touchPoint.y;
+    noteUserActivity();
     return;
   }
 
+  if (petGestureConsumed) {
+    return;
+  }
+
+  const int16_t dx = touchPoint.x - petTouchStartX;
+  const int16_t dy = touchPoint.y - petTouchStartY;
+  if (abs(dx) < kPetSwipeMinDx || abs(dy) > kPetSwipeMaxDy) {
+    return;
+  }
+
+  petGestureConsumed = true;
   petTouchArmed = false;
   noteUserActivity();
   lastActionMs = millis();
-  setState(UiState::PetAction);
+  setState(dx < 0 ? UiState::PetSwipeLeft : UiState::PetSwipeRight);
 }
 
 void tapKey(uint8_t key) {
@@ -1223,9 +1283,8 @@ void loop() {
     clearYellowButtonGesture();
   }
 
-  const uint32_t actionReturnMs =
-      currentState == UiState::PetAction ? kPetTouchActionMs : 1200;
-  if (millis() - lastActionMs > actionReturnMs && !voiceKeyDown) {
+  const uint32_t actionReturnMs = currentState == UiState::PetAction ? kPetTouchActionMs : 1200;
+  if (!isPetSwipeState() && millis() - lastActionMs > actionReturnMs && !voiceKeyDown) {
     setState(UiState::Ready);
   }
 
