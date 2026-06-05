@@ -20,4 +20,10 @@
 - Added Ready-state Usagi swipe gestures:
   - hold and swipe left to loop `running-left` until release;
   - hold and swipe right to loop `running-right` until release.
+- Hardened AMOLED panel maintenance so rare blue/purple tint or shifted-image
+  drift is reasserted during normal Ready/pet animation use, not only after the
+  screen has dimmed.
+- Refined the sleep clock layout with smaller Helvetica-style time digits that
+  stay within the left half, plus larger matching date/weekday text aligned to
+  the time block bottom.
 - Verified the firmware with `platformio run` and on-device USB flashing.

@@ -184,7 +184,7 @@ constexpr uint32_t kUndoWindowMs = 8000;
 constexpr uint32_t kDimAfterIdleMs = 30000;
 constexpr uint32_t kSleepAfterIdleMs = 300000;   // 5 min no activity -> screen off (sleep)
 constexpr uint32_t kImuPollIntervalMs = 120;     // raise-to-wake IMU poll cadence while asleep
-constexpr uint32_t kPanelRecoveryIntervalMs = 60000;  // heal AMOLED colour/window drift while idle
+constexpr uint32_t kPanelMaintenanceIntervalMs = 10000;  // heal AMOLED colour/window drift
 constexpr float kWakeMotionThreshold = 0.30f;    // g; sum of |accel delta| that counts as "picked up"
 constexpr uint8_t kSleepClockBrightness = 32;    // dim brightness for the always-on sleep clock
 constexpr uint32_t kRaiseWakeArmDelayMs = 1500;  // settle time before raise-to-wake arms after sleeping
@@ -226,6 +226,14 @@ uint16_t evenWidth(uint16_t width) {
 
 void finishImagePush() {
   M5.Display.setSwapBytes(false);
+}
+
+void reassertDisplayPanel(uint8_t brightness) {
+  M5.Display.wakeup();
+  M5.Display.init_without_reset();
+  M5.Display.setRotation(0);
+  M5.Display.setSwapBytes(false);
+  M5.Display.setBrightness(brightness);
 }
 
 void buzz(uint8_t level, uint16_t ms) {
@@ -344,7 +352,7 @@ void setDisplayDimmed(bool dimmed) {
   if (displayDimmed == dimmed) return;
   M5.Display.setBrightness(dimmed ? kDimBrightness : kActiveBrightness);
   displayDimmed = dimmed;
-  lastPanelRecoveryMs = dimmed ? millis() - kPanelRecoveryIntervalMs : millis();
+  lastPanelRecoveryMs = dimmed ? millis() - kPanelMaintenanceIntervalMs : millis();
 }
 
 void noteUserActivity() {
@@ -547,15 +555,15 @@ void drawSleepClock(bool force = false) {
   const float savedSizeX = M5.Display.getTextSizeX();
   const float savedSizeY = M5.Display.getTextSizeY();
 
-  // Left column: big rounded stacked hours over minutes, drawn from the
-  // pre-rendered anti-aliased digit bitmaps (smooth, no upscaling jaggies).
+  // Left column: stacked hours over minutes, drawn from pre-rendered
+  // anti-aliased digit bitmaps (smooth, no upscaling jaggies).
   const int dw = evenWidth(ClockFont::kDigitW);
   const int dh = ClockFont::kDigitH;
-  const int lx = 158;            // horizontal centre of the two-digit block
-  const int x0 = (lx - dw) & ~1; // left digit
-  const int x1 = lx & ~1;        // right digit
-  const int yH = 116;            // hours row top
-  const int yM = yH + dh + 6;    // minutes row top
+  const int x0 = 56;             // left digit
+  const int x1 = (x0 + dw) & ~1; // right digit
+  const int yH = 96;             // hours row top
+  const int yM = yH + dh + 10;   // minutes row top
+  const int leftBottom = yM + dh;
   if (hh >= 0) {
     M5.Display.setSwapBytes(true);
     M5.Display.pushImage(x0, yH, dw, dh, ClockFont::kDigits[(hh / 10) % 10]);
@@ -578,35 +586,33 @@ void drawSleepClock(bool force = false) {
   const bool haveWeather =
       wms != 0 && wtemp[0] != '\0' && (millis() - wms) < kWeatherStaleMs;
 
-  // Right column: weather/day-night icon, date, and temperature (or weekday).
-  const int rx = 356;
-  drawWeatherIcon(rx, 158, haveWeather ? wcond : -1, hh >= 6 && hh < 18);
+  // Right column: weather/day-night icon, date, and weekday.
+  const int rx = 342;
+  const float rightTextScale = 1.25f;
+  const int dateBottom = leftBottom - 52;
+  drawWeatherIcon(rx, 190, haveWeather ? wcond : -1, hh >= 6 && hh < 18);
 
   M5.Display.setFont(&fonts::Font4);
-  M5.Display.setTextSize(1);
+  M5.Display.setTextSize(rightTextScale);
   M5.Display.setTextColor(0xFFFFFF, kBg);
   if (mon >= 1) {
     // Date MM·DD with a small raised centre dot.
     char mmb[3], ddb[3];
     std::snprintf(mmb, sizeof(mmb), "%02d", mon);
     std::snprintf(ddb, sizeof(ddb), "%02d", day);
-    M5.Display.fillCircle(rx, 250, 2, 0xFFFFFF);
-    M5.Display.setTextDatum(middle_right);
-    M5.Display.drawString(mmb, rx - 7, 250);
-    M5.Display.setTextDatum(middle_left);
-    M5.Display.drawString(ddb, rx + 7, 250);
+    M5.Display.fillCircle(rx, dateBottom - 15, 3, 0xFFFFFF);
+    M5.Display.setTextDatum(bottom_right);
+    M5.Display.drawString(mmb, rx - 8, dateBottom);
+    M5.Display.setTextDatum(bottom_left);
+    M5.Display.drawString(ddb, rx + 8, dateBottom);
   }
 
-  if (haveWeather) {
-    drawSleepTemp(wtemp, rx, 300);
-  } else {
-    const char* wstr = (wd >= 0 && wd < 7) ? kWeekdayNames[wd] : "";
-    M5.Display.setFont(&fonts::Font4);
-    M5.Display.setTextSize(1);
-    M5.Display.setTextColor(0xFFFFFF, kBg);
-    M5.Display.setTextDatum(middle_center);
-    M5.Display.drawString(wstr, rx, 300);
-  }
+  const char* wstr = (wd >= 0 && wd < 7) ? kWeekdayNames[wd] : "";
+  M5.Display.setFont(&fonts::Font4);
+  M5.Display.setTextSize(rightTextScale);
+  M5.Display.setTextColor(0xFFFFFF, kBg);
+  M5.Display.setTextDatum(bottom_center);
+  M5.Display.drawString(wstr, rx, leftBottom);
 
   M5.Display.setFont(savedFont);
   M5.Display.setTextSize(savedSizeX, savedSizeY);
@@ -637,9 +643,7 @@ void wakeDisplay() {
   // Re-assert the panel registers (incl. RGB/BGR colour order) without a hard
   // reset or clearing. This heals the occasional "everything turns blue" glitch
   // so toggling sleep + waking recovers colour without a reboot.
-  M5.Display.init_without_reset();
-  M5.Display.setRotation(0);
-  M5.Display.setBrightness(kActiveBrightness);
+  reassertDisplayPanel(kActiveBrightness);
   drawStage();
   drawStatusIndicator(true);
   drawAnimationFrame(true);
@@ -647,24 +651,21 @@ void wakeDisplay() {
   lastPanelRecoveryMs = millis();
 }
 
-void recoverDisplayPanelIfIdle() {
-  if (displayAsleep || !displayDimmed || currentState != UiState::Ready || voiceKeyDown ||
-      pendingSendAfterVoice) {
+void maintainDisplayPanel() {
+  if (displayAsleep || voiceKeyDown || pendingSendAfterVoice ||
+      currentState == UiState::VoiceKeyHeld) {
     return;
   }
 
   const uint32_t now = millis();
-  if (now - lastPanelRecoveryMs < kPanelRecoveryIntervalMs) return;
+  if (now - lastPanelRecoveryMs < kPanelMaintenanceIntervalMs) return;
   lastPanelRecoveryMs = now;
 
   // The StopWatch AMOLED occasionally drifts into a bad colour/window state
-  // after long idle animation. Re-assert the panel state and fully redraw while
-  // idle; this mimics the manual power-button recover without interrupting input.
-  M5.Display.wakeup();
-  M5.Display.init_without_reset();
-  M5.Display.setRotation(0);
-  M5.Display.setSwapBytes(false);
-  M5.Display.setBrightness(kDimBrightness);
+  // during long animation runs. Re-assert the panel state and fully redraw in
+  // non-input states; this mimics the manual sleep/wake recovery without making
+  // the user press the power button.
+  reassertDisplayPanel(displayDimmed ? kDimBrightness : kActiveBrightness);
   drawStage();
   drawStatusIndicator(true);
   drawAnimationFrame(true);
@@ -710,6 +711,8 @@ void updateRaiseToWake() {
 }
 
 void showReadyState() {
+  reassertDisplayPanel(displayDimmed ? kDimBrightness : kActiveBrightness);
+  lastPanelRecoveryMs = millis();
   updateBatterySnapshot(true);
   if (shouldShowBatteryStatus()) {
     showAnimatedState(UsagiAnimations::idle, nullptr, 0, false, StatusIndicator::Battery);
@@ -1289,7 +1292,7 @@ void loop() {
   }
 
   updatePowerSaving();
-  recoverDisplayPanelIfIdle();
+  maintainDisplayPanel();
   if (displayAsleep) {
     drawSleepClock();
   } else {

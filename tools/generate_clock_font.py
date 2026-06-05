@@ -1,22 +1,22 @@
-"""Generate big anti-aliased rounded clock digits (0-9) as RGB565 C arrays.
+"""Generate big anti-aliased clock digits (0-9) as RGB565 C arrays.
 
-Renders white digits on black with a rounded system font (SF/Arial Rounded) at a
-size built-in lgfx fonts can't reach smoothly, and emits src/clock_font.{h,cpp}.
+Renders white digits on black with a light system font at a size built-in lgfx
+fonts can't reach smoothly, and emits src/clock_font.{h,cpp}.
 Byte order matches generate_usagi_assets.py (drawn with setSwapBytes(true)).
 """
 from PIL import Image, ImageFont, ImageDraw
 
-TARGET_H = 102          # desired digit pixel height
+TARGET_H = 112          # desired digit pixel height
 PAD_X = 6
 PAD_Y = 6
 OUT_H = "src/clock_font.h"
 OUT_CPP = "src/clock_font.cpp"
 
 FONT_CANDIDATES = [
-    "/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf",
-    "/System/Library/Fonts/SFCompactRounded.ttf",
-    "/System/Library/Fonts/SFNSRounded.ttf",
-    "/Library/Fonts/Arial Rounded Bold.ttf",
+    ("/System/Library/Fonts/HelveticaNeue.ttc", 12, "Helvetica Neue Thin"),
+    ("/System/Library/Fonts/HelveticaNeue.ttc", 7, "Helvetica Neue Light"),
+    ("/System/Library/Fonts/Avenir Next.ttc", 10, "Avenir Next Ultra Light"),
+    ("/System/Library/Fonts/SFNS.ttf", 0, "SF NS"),
 ]
 
 
@@ -25,14 +25,14 @@ def rgb565(r, g, b):
 
 
 def load_font():
-    for path in FONT_CANDIDATES:
+    for path, index, label in FONT_CANDIDATES:
         # binary-search a px size so "8" is ~TARGET_H tall
         try:
             lo, hi = 40, 400
             chosen = None
             for _ in range(20):
                 mid = (lo + hi) // 2
-                f = ImageFont.truetype(path, mid)
+                f = ImageFont.truetype(path, mid, index=index)
                 box = f.getbbox("8")
                 h = box[3] - box[1]
                 if abs(h - TARGET_H) <= 1:
@@ -43,11 +43,11 @@ def load_font():
                 else:
                     hi = mid - 1
                 chosen = f
-            print(f"[clock_font] using {path} size~{chosen.size}")
+            print(f"[clock_font] using {label} ({path}#{index}) size~{chosen.size}")
             return chosen
         except Exception as e:
-            print(f"[clock_font] skip {path}: {e}")
-    raise SystemExit("No usable rounded font found")
+            print(f"[clock_font] skip {label}: {e}")
+    raise SystemExit("No usable clock font found")
 
 
 def render_digit(font, ch):
@@ -64,7 +64,7 @@ def main():
     glyphs = [render_digit(font, str(n)) for n in range(10)]
     cw = max(g.width for g in glyphs)
     ch = max(g.height for g in glyphs)
-    cell_w = cw + PAD_X * 2
+    cell_w = (cw + PAD_X * 2 + 1) & ~1
     cell_h = ch + PAD_Y * 2
     print(f"[clock_font] cell = {cell_w} x {cell_h}")
 
