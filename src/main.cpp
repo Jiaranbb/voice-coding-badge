@@ -8,6 +8,7 @@
 #include "weather_icons.h"
 #include "midi_player.h"
 #include "ha_audio.h"
+#include "wula_audio.h"
 #include <esp_system.h>
 #include <NimBLEDevice.h>
 
@@ -135,6 +136,7 @@ static uint32_t lastUserActivityMs = 0;
 static bool displayDimmed = false;
 static bool displayAsleep = false;
 static uint32_t lastImuPollMs = 0;
+static uint32_t lastPanelRecoveryMs = 0;
 static float lastAccelX = 0.0f;
 static float lastAccelY = 0.0f;
 static float lastAccelZ = 0.0f;
@@ -176,6 +178,7 @@ constexpr uint32_t kUndoWindowMs = 8000;
 constexpr uint32_t kDimAfterIdleMs = 30000;
 constexpr uint32_t kSleepAfterIdleMs = 300000;   // 5 min no activity -> screen off (sleep)
 constexpr uint32_t kImuPollIntervalMs = 120;     // raise-to-wake IMU poll cadence while asleep
+constexpr uint32_t kPanelRecoveryIntervalMs = 60000;  // heal AMOLED colour/window drift while idle
 constexpr float kWakeMotionThreshold = 0.30f;    // g; sum of |accel delta| that counts as "picked up"
 constexpr uint8_t kSleepClockBrightness = 32;    // dim brightness for the always-on sleep clock
 constexpr uint32_t kRaiseWakeArmDelayMs = 1500;  // settle time before raise-to-wake arms after sleeping
@@ -205,6 +208,18 @@ constexpr int32_t kPetTouchPadding = 16;
 constexpr int32_t kStatusAreaH = 92;
 constexpr uint16_t kReadyLabelRevealMs = 1800;
 
+int32_t evenCenterX(uint16_t width) {
+  return ((M5.Display.width() - width) / 2) & ~1;
+}
+
+uint16_t evenWidth(uint16_t width) {
+  return width & ~1;
+}
+
+void finishImagePush() {
+  M5.Display.setSwapBytes(false);
+}
+
 void buzz(uint8_t level, uint16_t ms) {
   M5.Power.setVibration(level);
   delay(ms);
@@ -220,6 +235,10 @@ void buzzPattern(uint8_t count) {
 
 void playWaitingCue() {
   MidiPlayer::playSample(HaAudio::kSamples, HaAudio::kSampleCount, HaAudio::kSampleRate);
+}
+
+void playWaiting2Cue() {
+  MidiPlayer::playSample(WulaAudio::kSamples, WulaAudio::kSampleCount, WulaAudio::kSampleRate);
 }
 
 void drawStage() {
@@ -317,6 +336,7 @@ void setDisplayDimmed(bool dimmed) {
   if (displayDimmed == dimmed) return;
   M5.Display.setBrightness(dimmed ? kDimBrightness : kActiveBrightness);
   displayDimmed = dimmed;
+  lastPanelRecoveryMs = dimmed ? millis() - kPanelRecoveryIntervalMs : millis();
 }
 
 void noteUserActivity() {
@@ -357,21 +377,21 @@ void drawStatusLabel(bool force = false) {
     return;
   }
 
-  const uint16_t visibleWidth = getLabelVisibleWidth();
+  const uint16_t visibleWidth = evenWidth(getLabelVisibleWidth());
   if (!force && visibleWidth == lastLabelVisibleWidth) return;
   lastLabelVisibleWidth = visibleWidth;
 
-  const int32_t x = (M5.Display.width() - activeLabel->width) / 2;
-  M5.Display.fillRect(x, kLabelY, activeLabel->width, activeLabel->height, kBg);
+  const uint16_t clearW = evenWidth(activeLabel->width);
+  const int32_t x = evenCenterX(clearW);
+  M5.Display.fillRect(x, kLabelY, clearW, activeLabel->height, kBg);
   if (visibleWidth == 0) return;
 
-  const bool previousSwap = M5.Display.getSwapBytes();
   M5.Display.setSwapBytes(true);
   for (uint16_t row = 0; row < activeLabel->height; ++row) {
     const uint16_t* rowPixels = activeLabel->pixels + (row * activeLabel->width);
     M5.Display.pushImage(x, kLabelY + row, visibleWidth, 1, rowPixels);
   }
-  M5.Display.setSwapBytes(previousSwap);
+  finishImagePush();
 }
 
 void drawVoiceMeter(bool force = false) {
@@ -383,13 +403,13 @@ void drawVoiceMeter(bool force = false) {
   const uint32_t now = millis();
   if (!force && now - lastStatusFrameMs < activeStatusAnimation->frameMs) return;
 
-  const int32_t x = (M5.Display.width() - activeStatusAnimation->width) / 2;
+  const uint16_t width = evenWidth(activeStatusAnimation->width);
+  const int32_t x = evenCenterX(width);
   const uint16_t* frame = activeStatusAnimation->frames[activeStatusFrame];
-  const bool previousSwap = M5.Display.getSwapBytes();
   M5.Display.setSwapBytes(true);
   M5.Display.pushImage(
-      x, kVoiceMeterY, activeStatusAnimation->width, activeStatusAnimation->height, frame);
-  M5.Display.setSwapBytes(previousSwap);
+      x, kVoiceMeterY, width, activeStatusAnimation->height, frame);
+  finishImagePush();
 
   activeStatusFrame = (activeStatusFrame + 1) % activeStatusAnimation->frameCount;
   lastStatusFrameMs = now;
@@ -412,11 +432,11 @@ void drawAnimationFrame(bool force = false) {
   if (!force && now - lastFrameMs < activeClip->frameMs) return;
 
   const uint16_t* frame = activeClip->frames[activeFrame];
-  const int32_t x = (M5.Display.width() - activeClip->width) / 2;
-  const bool previousSwap = M5.Display.getSwapBytes();
+  const uint16_t width = evenWidth(activeClip->width);
+  const int32_t x = evenCenterX(width);
   M5.Display.setSwapBytes(true);
-  M5.Display.pushImage(x, kPetY, activeClip->width, activeClip->height, frame);
-  M5.Display.setSwapBytes(previousSwap);
+  M5.Display.pushImage(x, kPetY, width, activeClip->height, frame);
+  finishImagePush();
 
   activeFrame = (activeFrame + 1) % activeClip->frameCount;
   lastFrameMs = now;
@@ -465,11 +485,12 @@ void drawWeatherIcon(int ix, int iy, int cond, bool day) {
     case 5: bmp = WeatherIcons::storm; break;
     default: bmp = day ? WeatherIcons::sun : WeatherIcons::moon; break;
   }
-  const int w = WeatherIcons::kIconW, h = WeatherIcons::kIconH;
-  const bool prevSwap = M5.Display.getSwapBytes();
+  const int w = evenWidth(WeatherIcons::kIconW);
+  const int h = WeatherIcons::kIconH;
+  const int x = (ix - w / 2) & ~1;
   M5.Display.setSwapBytes(true);
-  M5.Display.pushImage(ix - w / 2, iy - h / 2, w, h, bmp);
-  M5.Display.setSwapBytes(prevSwap);
+  M5.Display.pushImage(x, iy - h / 2, w, h, bmp);
+  finishImagePush();
 }
 
 // Draw "<num>°C" centred at (cx, y) with Font4 and a small raised degree ring.
@@ -520,21 +541,20 @@ void drawSleepClock(bool force = false) {
 
   // Left column: big rounded stacked hours over minutes, drawn from the
   // pre-rendered anti-aliased digit bitmaps (smooth, no upscaling jaggies).
-  const int dw = ClockFont::kDigitW;
+  const int dw = evenWidth(ClockFont::kDigitW);
   const int dh = ClockFont::kDigitH;
   const int lx = 158;            // horizontal centre of the two-digit block
-  const int x0 = lx - dw;        // left digit
-  const int x1 = lx;             // right digit
+  const int x0 = (lx - dw) & ~1; // left digit
+  const int x1 = lx & ~1;        // right digit
   const int yH = 116;            // hours row top
   const int yM = yH + dh + 6;    // minutes row top
   if (hh >= 0) {
-    const bool prevSwap = M5.Display.getSwapBytes();
     M5.Display.setSwapBytes(true);
     M5.Display.pushImage(x0, yH, dw, dh, ClockFont::kDigits[(hh / 10) % 10]);
     M5.Display.pushImage(x1, yH, dw, dh, ClockFont::kDigits[hh % 10]);
     M5.Display.pushImage(x0, yM, dw, dh, ClockFont::kDigits[(mm / 10) % 10]);
     M5.Display.pushImage(x1, yM, dw, dh, ClockFont::kDigits[mm % 10]);
-    M5.Display.setSwapBytes(prevSwap);
+    finishImagePush();
   }
 
   // Read the weather snapshot once (pushed from the Mac over BLE).
@@ -612,6 +632,31 @@ void wakeDisplay() {
   M5.Display.init_without_reset();
   M5.Display.setRotation(0);
   M5.Display.setBrightness(kActiveBrightness);
+  drawStage();
+  drawStatusIndicator(true);
+  drawAnimationFrame(true);
+  drawBatteryIndicator(true);
+  lastPanelRecoveryMs = millis();
+}
+
+void recoverDisplayPanelIfIdle() {
+  if (displayAsleep || !displayDimmed || currentState != UiState::Ready || voiceKeyDown ||
+      pendingSendAfterVoice) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (now - lastPanelRecoveryMs < kPanelRecoveryIntervalMs) return;
+  lastPanelRecoveryMs = now;
+
+  // The StopWatch AMOLED occasionally drifts into a bad colour/window state
+  // after long idle animation. Re-assert the panel state and fully redraw while
+  // idle; this mimics the manual power-button recover without interrupting input.
+  M5.Display.wakeup();
+  M5.Display.init_without_reset();
+  M5.Display.setRotation(0);
+  M5.Display.setSwapBytes(false);
+  M5.Display.setBrightness(kDimBrightness);
   drawStage();
   drawStatusIndicator(true);
   drawAnimationFrame(true);
@@ -736,7 +781,8 @@ void setState(UiState state) {
         showAnimatedState(UsagiAnimations::waiting);
         playWaitingCue();
       } else {
-        showAnimatedState(UsagiAnimations::failed);
+        showAnimatedState(UsagiAnimations::waiting2);
+        playWaiting2Cue();
       }
       break;
     case UiState::TestMode:
@@ -748,7 +794,7 @@ void setState(UiState state) {
 bool isTouchInsidePet(int16_t x, int16_t y) {
   if (activeClip == nullptr) return false;
 
-  const int32_t petX = (M5.Display.width() - activeClip->width) / 2;
+  const int32_t petX = evenCenterX(activeClip->width);
   const int32_t left = petX - kPetTouchPadding;
   const int32_t right = petX + activeClip->width + kPetTouchPadding;
   const int32_t top = kPetY - kPetTouchPadding;
@@ -1184,6 +1230,7 @@ void loop() {
   }
 
   updatePowerSaving();
+  recoverDisplayPanelIfIdle();
   if (displayAsleep) {
     drawSleepClock();
   } else {

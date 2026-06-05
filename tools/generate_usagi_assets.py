@@ -37,6 +37,7 @@ CLIPS = {
     "waiting": {"frame_ms": 150, "asset_dir": "waiting"},
     "sent": {"frame_ms": 150, "asset_dir": "sent"},
     "failed": {"frame_ms": 150, "asset_dir": "failed"},
+    "waiting2": {"frame_ms": 150, "copy_from": "failed"},
 }
 
 
@@ -235,6 +236,7 @@ extern const UsagiAnimationClip jumping;
 extern const UsagiAnimationClip waiting;
 extern const UsagiAnimationClip sent;
 extern const UsagiAnimationClip failed;
+extern const UsagiAnimationClip waiting2;
 
 extern const UsagiStatusLabel labelReady;
 extern const UsagiStatusLabel labelCancelled;

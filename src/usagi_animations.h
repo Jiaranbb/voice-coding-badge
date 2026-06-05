@@ -31,6 +31,7 @@ extern const UsagiAnimationClip jumping;
 extern const UsagiAnimationClip waiting;
 extern const UsagiAnimationClip sent;
 extern const UsagiAnimationClip failed;
+extern const UsagiAnimationClip waiting2;
 
 extern const UsagiStatusLabel labelReady;
 extern const UsagiStatusLabel labelCancelled;
