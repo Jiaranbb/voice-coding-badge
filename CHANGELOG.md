@@ -26,4 +26,16 @@
 - Refined the sleep clock layout with smaller Helvetica-style time digits that
   stay within the left half, plus larger matching date/weekday text aligned to
   the time block bottom.
+- Changed the Yellow+Blue button combo into a two-mode display toggle:
+  - Mode 1 is the default Voice Coding interface;
+  - Mode 2 is a full-bright clock/weather/date/weekday interface.
+- Let the full-bright clock mode dim after the same 30-second idle timeout as
+  the Voice Coding interface while preserving the selected mode.
+- Restored raise-to-wake from the dimmed state, not only from the full sleep
+  state.
+- Replaced scaled built-in date/weekday text with pre-rendered Helvetica-style
+  bitmap glyphs for crisper clock-mode typography.
+- Added touch-to-wake support while the clock display is dimmed or asleep.
+- Simplified the automatic sleep display so it dims only on sleep entry and draws
+  one centered static clock face without minute-by-minute refreshes.
 - Verified the firmware with `platformio run` and on-device USB flashing.

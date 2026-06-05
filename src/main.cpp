@@ -127,7 +127,13 @@ enum class StatusIndicator {
   Battery
 };
 
+enum class DisplayMode {
+  VoiceCoding,
+  Clock
+};
+
 static UiState currentState = UiState::Booting;
+static DisplayMode displayMode = DisplayMode::VoiceCoding;
 static bool voiceKeyDown = false;
 static bool voiceLatchMode = false;
 static uint32_t voiceStartMs = 0;
@@ -145,6 +151,7 @@ static float lastAccelZ = 0.0f;
 static bool accelBaselineValid = false;
 static int lastDrawnClockHm = -1;
 static uint32_t sleepEnterMs = 0;
+static uint32_t motionWakeArmMs = 0;
 static bool comboToggleHandled = false;
 static bool lastBleConnected = false;
 static bool pendingSendAfterVoice = false;
@@ -183,11 +190,11 @@ constexpr uint32_t kVoiceSendDelayMs = kVoiceCommitDelayMs;
 constexpr uint32_t kUndoWindowMs = 8000;
 constexpr uint32_t kDimAfterIdleMs = 30000;
 constexpr uint32_t kSleepAfterIdleMs = 300000;   // 5 min no activity -> screen off (sleep)
-constexpr uint32_t kImuPollIntervalMs = 120;     // raise-to-wake IMU poll cadence while asleep
+constexpr uint32_t kImuPollIntervalMs = 120;     // raise-to-wake IMU poll cadence while dimmed/asleep
 constexpr uint32_t kPanelMaintenanceIntervalMs = 10000;  // heal AMOLED colour/window drift
 constexpr float kWakeMotionThreshold = 0.30f;    // g; sum of |accel delta| that counts as "picked up"
 constexpr uint8_t kSleepClockBrightness = 32;    // dim brightness for the always-on sleep clock
-constexpr uint32_t kRaiseWakeArmDelayMs = 1500;  // settle time before raise-to-wake arms after sleeping
+constexpr uint32_t kRaiseWakeArmDelayMs = 1500;  // settle time before raise-to-wake arms after dimming
 constexpr uint32_t kWeatherStaleMs = 3UL * 60 * 60 * 1000;  // weather older than 3h -> fall back to weekday
 constexpr uint32_t kBatteryRefreshMs = 5000;
 constexpr uint32_t kVoiceHoldStartMs = 180;
@@ -353,6 +360,8 @@ void setDisplayDimmed(bool dimmed) {
   M5.Display.setBrightness(dimmed ? kDimBrightness : kActiveBrightness);
   displayDimmed = dimmed;
   lastPanelRecoveryMs = dimmed ? millis() - kPanelMaintenanceIntervalMs : millis();
+  motionWakeArmMs = millis();
+  accelBaselineValid = false;
 }
 
 void noteUserActivity() {
@@ -362,7 +371,7 @@ void noteUserActivity() {
 }
 
 void updatePowerSaving() {
-  if (voiceKeyDown) return;
+  if (voiceKeyDown || displayAsleep) return;
 
   const uint32_t now = millis();
   const uint32_t idle = now - lastUserActivityMs;
@@ -526,11 +535,52 @@ void drawSleepTemp(const char* num, int cx, int y) {
   M5.Display.drawString("C", ringCx + ringR + gap2, y);
 }
 
-// Sleep "always-on" clock: shows Beijing time HH:MM plus the weekday (English),
-// no animation. Redraws only when the minute changes to save power.
-void drawSleepClock(bool force = false) {
-  if (!displayAsleep) return;
+const ClockFont::SmallGlyph* findClockSmallGlyph(char ch) {
+  for (int i = 0; i < ClockFont::kSmallGlyphCount; ++i) {
+    if (ClockFont::kSmallGlyphs[i].ch == ch) return &ClockFont::kSmallGlyphs[i];
+  }
+  return nullptr;
+}
 
+int clockSmallTextWidth(const char* text) {
+  constexpr int kTracking = 2;
+  int width = 0;
+  int glyphCount = 0;
+  for (const char* p = text; *p != '\0'; ++p) {
+    const ClockFont::SmallGlyph* glyph = findClockSmallGlyph(*p);
+    if (glyph == nullptr) continue;
+    width += glyph->width;
+    ++glyphCount;
+  }
+  if (glyphCount > 1) width += (glyphCount - 1) * kTracking;
+  return width;
+}
+
+void drawClockSmallTextLeft(const char* text, int x, int bottom) {
+  constexpr int kTracking = 2;
+  int cursor = x & ~1;
+  const int y = bottom - ClockFont::kSmallGlyphH;
+  M5.Display.setSwapBytes(true);
+  for (const char* p = text; *p != '\0'; ++p) {
+    const ClockFont::SmallGlyph* glyph = findClockSmallGlyph(*p);
+    if (glyph == nullptr) continue;
+    M5.Display.pushImage(cursor, y, glyph->width, ClockFont::kSmallGlyphH, glyph->pixels);
+    cursor = (cursor + glyph->width + kTracking) & ~1;
+  }
+  finishImagePush();
+}
+
+void drawClockSmallTextRight(const char* text, int right, int bottom) {
+  drawClockSmallTextLeft(text, right - clockSmallTextWidth(text), bottom);
+}
+
+void drawClockSmallTextCenter(const char* text, int cx, int bottom) {
+  drawClockSmallTextLeft(text, cx - clockSmallTextWidth(text) / 2, bottom);
+}
+
+// Full-bright clock mode: shows Beijing time, weather, date, and weekday.
+// Redraws only when the minute/weather changes.
+void drawClockFace(bool force = false) {
   int hh = -1, mm = -1, mon = -1, day = -1, wd = -1;
   if (M5.Rtc.isEnabled()) {
     const auto dt = M5.Rtc.getDateTime();  // RTC holds Beijing local time
@@ -588,31 +638,70 @@ void drawSleepClock(bool force = false) {
 
   // Right column: weather/day-night icon, date, and weekday.
   const int rx = 342;
-  const float rightTextScale = 1.25f;
   const int dateBottom = leftBottom - 52;
   drawWeatherIcon(rx, 190, haveWeather ? wcond : -1, hh >= 6 && hh < 18);
 
-  M5.Display.setFont(&fonts::Font4);
-  M5.Display.setTextSize(rightTextScale);
-  M5.Display.setTextColor(0xFFFFFF, kBg);
   if (mon >= 1) {
     // Date MM·DD with a small raised centre dot.
     char mmb[3], ddb[3];
     std::snprintf(mmb, sizeof(mmb), "%02d", mon);
     std::snprintf(ddb, sizeof(ddb), "%02d", day);
-    M5.Display.fillCircle(rx, dateBottom - 15, 3, 0xFFFFFF);
-    M5.Display.setTextDatum(bottom_right);
-    M5.Display.drawString(mmb, rx - 8, dateBottom);
-    M5.Display.setTextDatum(bottom_left);
-    M5.Display.drawString(ddb, rx + 8, dateBottom);
+    M5.Display.fillCircle(rx, dateBottom - ClockFont::kSmallGlyphH / 2, 3, 0xFFFFFF);
+    drawClockSmallTextRight(mmb, rx - 9, dateBottom);
+    drawClockSmallTextLeft(ddb, rx + 9, dateBottom);
   }
 
   const char* wstr = (wd >= 0 && wd < 7) ? kWeekdayNames[wd] : "";
-  M5.Display.setFont(&fonts::Font4);
-  M5.Display.setTextSize(rightTextScale);
-  M5.Display.setTextColor(0xFFFFFF, kBg);
-  M5.Display.setTextDatum(bottom_center);
-  M5.Display.drawString(wstr, rx, leftBottom);
+  drawClockSmallTextCenter(wstr, rx, leftBottom);
+
+  M5.Display.setFont(savedFont);
+  M5.Display.setTextSize(savedSizeX, savedSizeY);
+  M5.Display.setTextDatum(savedDatum);
+}
+
+// Dim sleep clock: draw once when sleep starts, then leave the AMOLED static.
+// This avoids repeated RTC/weather reads and only lights the centered digits.
+void drawSleepClock(bool force = false) {
+  if (!displayAsleep || !force) return;
+
+  int hh = -1, mm = -1;
+  if (M5.Rtc.isEnabled()) {
+    const auto dt = M5.Rtc.getDateTime();  // RTC holds Beijing local time
+    hh = dt.time.hours;
+    mm = dt.time.minutes;
+  }
+
+  M5.Display.fillScreen(kBg);
+
+  const auto savedFont = M5.Display.getFont();
+  const auto savedDatum = M5.Display.getTextDatum();
+  const float savedSizeX = M5.Display.getTextSizeX();
+  const float savedSizeY = M5.Display.getTextSizeY();
+
+  if (hh >= 0) {
+    const int dw = evenWidth(ClockFont::kDigitW);
+    const int dh = ClockFont::kDigitH;
+    const int gapY = 10;
+    const int blockW = dw * 2;
+    const int blockH = dh * 2 + gapY;
+    const int x0 = ((M5.Display.width() - blockW) / 2) & ~1;
+    const int x1 = (x0 + dw) & ~1;
+    const int yH = (M5.Display.height() - blockH) / 2;
+    const int yM = yH + dh + gapY;
+
+    M5.Display.setSwapBytes(true);
+    M5.Display.pushImage(x0, yH, dw, dh, ClockFont::kDigits[(hh / 10) % 10]);
+    M5.Display.pushImage(x1, yH, dw, dh, ClockFont::kDigits[hh % 10]);
+    M5.Display.pushImage(x0, yM, dw, dh, ClockFont::kDigits[(mm / 10) % 10]);
+    M5.Display.pushImage(x1, yM, dw, dh, ClockFont::kDigits[mm % 10]);
+    finishImagePush();
+  } else {
+    M5.Display.setFont(&fonts::Font4);
+    M5.Display.setTextSize(2);
+    M5.Display.setTextColor(0xFFFFFF, kBg);
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.drawString("--:--", M5.Display.width() / 2, M5.Display.height() / 2);
+  }
 
   M5.Display.setFont(savedFont);
   M5.Display.setTextSize(savedSizeX, savedSizeY);
@@ -626,8 +715,10 @@ void enterDisplaySleep() {
   if (displayAsleep) return;
   MidiPlayer::stop();
   displayAsleep = true;
+  displayDimmed = true;
   sleepEnterMs = millis();
-  lastDrawnClockHm = -1;        // force a fresh clock draw
+  motionWakeArmMs = sleepEnterMs;
+  lastDrawnClockHm = -1;
   M5.Display.setBrightness(kSleepClockBrightness);
   drawSleepClock(true);
   accelBaselineValid = false;  // re-establish the motion baseline on next poll
@@ -639,27 +730,40 @@ void enterDisplaySleep() {
 void wakeDisplay() {
   if (!displayAsleep) return;
   displayAsleep = false;
+  displayDimmed = false;
   lastDrawnClockHm = -1;
   // Re-assert the panel registers (incl. RGB/BGR colour order) without a hard
   // reset or clearing. This heals the occasional "everything turns blue" glitch
   // so toggling sleep + waking recovers colour without a reboot.
   reassertDisplayPanel(kActiveBrightness);
-  drawStage();
-  drawStatusIndicator(true);
-  drawAnimationFrame(true);
-  drawBatteryIndicator(true);
+  if (displayMode == DisplayMode::Clock) {
+    drawClockFace(true);
+  } else {
+    drawStage();
+    drawStatusIndicator(true);
+    drawAnimationFrame(true);
+    drawBatteryIndicator(true);
+  }
   lastPanelRecoveryMs = millis();
 }
 
 void maintainDisplayPanel() {
-  if (displayAsleep || voiceKeyDown || pendingSendAfterVoice ||
-      currentState == UiState::VoiceKeyHeld) {
-    return;
-  }
+  if (displayAsleep) return;
 
   const uint32_t now = millis();
   if (now - lastPanelRecoveryMs < kPanelMaintenanceIntervalMs) return;
   lastPanelRecoveryMs = now;
+
+  if (displayMode == DisplayMode::Clock) {
+    reassertDisplayPanel(displayDimmed ? kDimBrightness : kActiveBrightness);
+    lastDrawnClockHm = -1;
+    drawClockFace(true);
+    return;
+  }
+
+  if (voiceKeyDown || pendingSendAfterVoice || currentState == UiState::VoiceKeyHeld) {
+    return;
+  }
 
   // The StopWatch AMOLED occasionally drifts into a bad colour/window state
   // during long animation runs. Re-assert the panel state and fully redraw in
@@ -672,16 +776,16 @@ void maintainDisplayPanel() {
   drawBatteryIndicator(true);
 }
 
-// Raise-to-wake: while asleep, poll the IMU and wake when the device is moved
-// (e.g. picked up). Falls back to no-op if the IMU is unavailable; buttons
-// still wake the screen via noteUserActivity().
+// Raise-to-wake: while dimmed or asleep, poll the IMU and wake when the device
+// is moved (e.g. picked up). Falls back to no-op if the IMU is unavailable;
+// buttons still wake the screen via noteUserActivity().
 void updateRaiseToWake() {
-  if (!displayAsleep || !M5.Imu.isEnabled()) return;
+  if ((!displayAsleep && !displayDimmed) || !M5.Imu.isEnabled()) return;
 
   const uint32_t now = millis();
-  // Grace period after entering sleep: let the button press / hand motion settle
-  // before arming raise-to-wake, otherwise a manual power-key sleep wakes instantly.
-  if (now - sleepEnterMs < kRaiseWakeArmDelayMs) {
+  // Grace period after dimming/sleeping: let the button press / hand motion settle
+  // before arming raise-to-wake, otherwise the display can brighten instantly.
+  if (now - motionWakeArmMs < kRaiseWakeArmDelayMs) {
     accelBaselineValid = false;
     return;
   }
@@ -808,6 +912,33 @@ void setState(UiState state) {
   }
 }
 
+void enterVoiceCodingMode() {
+  displayMode = DisplayMode::VoiceCoding;
+  lastDrawnClockHm = -1;
+  noteUserActivity();
+  if (testMode) {
+    setState(UiState::TestMode);
+  } else {
+    setState(bleKeyboard.isConnected() ? UiState::Ready : UiState::WaitingForBluetooth);
+  }
+}
+
+void enterClockMode() {
+  displayMode = DisplayMode::Clock;
+  lastDrawnClockHm = -1;
+  noteUserActivity();
+  reassertDisplayPanel(kActiveBrightness);
+  drawClockFace(true);
+}
+
+void toggleDisplayMode() {
+  if (displayMode == DisplayMode::Clock) {
+    enterVoiceCodingMode();
+  } else {
+    enterClockMode();
+  }
+}
+
 bool isPetSwipeState() {
   return currentState == UiState::PetSwipeLeft || currentState == UiState::PetSwipeRight;
 }
@@ -821,6 +952,12 @@ bool isTouchInsidePet(int16_t x, int16_t y) {
   const int32_t top = kPetY - kPetTouchPadding;
   const int32_t bottom = kPetY + activeClip->height + kPetTouchPadding;
   return x >= left && x <= right && y >= top && y <= bottom;
+}
+
+bool screenTouched() {
+  if (M5.Display.touch() == nullptr) return false;
+  m5gfx::touch_point_t touchPoint;
+  return M5.Display.getTouch(&touchPoint, 1) > 0;
 }
 
 void handleReadyPetTouch() {
@@ -1148,9 +1285,9 @@ void loop() {
   }
   lastBleConnected = bleConnected;
 
-  // Yellow + Blue pressed together toggles the sleep clock. (The red/power key is
-  // wired straight to the PMIC and isn't reported to firmware on this board, so
-  // we use a two-button combo instead.) A short buzz confirms the toggle.
+  // Yellow + Blue pressed together toggles display mode:
+  // Voice Coding -> full-bright clock -> Voice Coding. (The red/power key is
+  // wired straight to the PMIC and isn't reported to firmware on this board.)
   const bool bothButtonsDown = M5.BtnA.isPressed() && M5.BtnB.isPressed();
   if (bothButtonsDown && !comboToggleHandled) {
     comboToggleHandled = true;
@@ -1158,26 +1295,35 @@ void loop() {
     clearYellowButtonGesture();
     clearPendingSendAfterVoice();
     buzz(120, 40);
-    if (displayAsleep) {
-      noteUserActivity();  // wake
-    } else {
-      lastUserActivityMs = millis();
-      enterDisplaySleep();  // sleep
-    }
+    toggleDisplayMode();
   } else if (!bothButtonsDown) {
     comboToggleHandled = false;
   }
 
-  // While asleep, only the always-on clock and wake detection run. Returning
+  // While asleep, only the static dim clock and wake detection run. Returning
   // early keeps the voice/UI drawing (setState, animations) from painting over
-  // the clock. A single front-button press or movement wakes; both-button combo
-  // is handled above (and must not double-trigger a wake here).
+  // the clock. The clock is drawn once on sleep entry; it is intentionally not
+  // refreshed every minute.
   if (displayAsleep) {
     updateRaiseToWake();
-    if (!bothButtonsDown && (M5.BtnA.wasPressed() || M5.BtnB.wasPressed())) {
+    if (!bothButtonsDown && (M5.BtnA.wasPressed() || M5.BtnB.wasPressed() || screenTouched())) {
       noteUserActivity();
-    } else {
-      drawSleepClock();
+    }
+    delay(20);
+    return;
+  }
+
+  // Full-bright clock mode is display-only. Single button presses only keep the
+  // screen awake; the two-button combo above switches back to Voice Coding.
+  if (displayMode == DisplayMode::Clock) {
+    if (!bothButtonsDown && (M5.BtnA.wasPressed() || M5.BtnB.wasPressed() || screenTouched())) {
+      noteUserActivity();
+    }
+    updatePowerSaving();
+    updateRaiseToWake();
+    if (!displayAsleep) {
+      maintainDisplayPanel();
+      drawClockFace();
     }
     delay(20);
     return;
@@ -1193,8 +1339,10 @@ void loop() {
     clearYellowButtonGesture();
     if (!testMode) setState(UiState::WaitingForBluetooth);
     updatePowerSaving();
+    updateRaiseToWake();
     if (displayAsleep) {
-      drawSleepClock();
+      delay(20);
+      return;
     } else {
       drawStatusIndicator();
       drawAnimationFrame();
@@ -1219,6 +1367,7 @@ void loop() {
     drawAnimationFrame();
     drawBatteryIndicator();
     updatePowerSaving();
+    updateRaiseToWake();
     delay(20);
     return;
   }
@@ -1227,6 +1376,7 @@ void loop() {
   // don't treat the held buttons as voice/send — just keep the normal UI up.
   if (bothButtonsDown || comboToggleHandled) {
     updatePowerSaving();
+    updateRaiseToWake();
     refreshReadyStatusIndicator();
     drawStatusIndicator();
     drawAnimationFrame();
@@ -1270,6 +1420,7 @@ void loop() {
       drawAnimationFrame();
       drawBatteryIndicator();
       updatePowerSaving();
+      updateRaiseToWake();
       delay(20);
       return;
     }
@@ -1292,9 +1443,11 @@ void loop() {
   }
 
   updatePowerSaving();
+  updateRaiseToWake();
   maintainDisplayPanel();
   if (displayAsleep) {
-    drawSleepClock();
+    delay(20);
+    return;
   } else {
     refreshReadyStatusIndicator();
     drawStatusIndicator();
